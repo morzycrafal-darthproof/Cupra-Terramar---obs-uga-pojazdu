@@ -1,0 +1,15 @@
+{
+  "name": "Cupra Terramar — Dziennik pokładowy",
+  "short_name": "Cupra Terramar",
+  "description": "Monitoring tankowań, serwisów i kosztów Cupra Terramar",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0F0D0C",
+  "theme_color": "#0F0D0C",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
