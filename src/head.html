@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Cupra Terramar — Dziennik pokładowy</title>
+<meta name="theme-color" content="#0F0D0C" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Cupra Terramar" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:#0F0D0C; }
+  body { font-family: 'Inter', -apple-system, sans-serif; -webkit-tap-highlight-color: transparent; }
+  input:focus, select:focus { border-color:#C96A34 !important; }
+  select { appearance:none; -webkit-appearance:none; }
+  ::-webkit-scrollbar { width:0; height:0; }
+  #root { min-height: 100vh; }
+  #boot-msg { color:#9C948B; text-align:center; padding:40vh 24px 0; font-family: -apple-system, sans-serif; font-size:14px; line-height:1.6; }
+  #boot-hint { display:none; color:#665F58; font-size:12px; margin-top:14px; }
+  #boot-error { display:none; color:#C4483C; background:#C4483C22; border:1px solid #C4483C55; border-radius:10px; padding:12px; margin:16px; font-family: monospace; font-size:12px; white-space:pre-wrap; word-break:break-word; text-align:left; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="boot-msg">
+    Uruchamianie…
+    <div id="boot-hint">To trwa dłużej niż zwykle — jeśli nic się nie pojawi, spróbuj otworzyć ten plik bezpośrednio z listy pobranych plików w Chrome (menu ⋮ → Pobrane), zamiast z innej aplikacji plików.</div>
+  </div>
+</div>
+<div id="boot-error"></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("boot-error");
+    if (box) {
+      box.style.display = "block";
+      box.textContent = "Błąd JavaScript:\n" + (e.message || "nieznany błąd") +
+        (e.filename ? ("\nPlik: " + e.filename + ":" + e.lineno + ":" + e.colno) : "");
+    }
+  });
+  setTimeout(function () {
+    var hint = document.getElementById("boot-hint");
+    if (hint && document.getElementById("boot-msg")) hint.style.display = "block";
+  }, 4000);
+</script>

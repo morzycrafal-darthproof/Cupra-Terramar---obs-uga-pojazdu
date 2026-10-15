@@ -1,0 +1,13 @@
+{
+  "name": "cupra-terramar",
+  "private": true,
+  "description": "Cupra Terramar — Dziennik pokładowy (PWA)",
+  "scripts": {
+    "build": "py build.py"
+  },
+  "devDependencies": {
+    "@babel/cli": "7.24.7",
+    "@babel/core": "7.24.7",
+    "@babel/preset-react": "7.24.7"
+  }
+}

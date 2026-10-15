@@ -626,7 +626,9 @@ const SEED_SETTINGS = {
   consumptionHighFrom: 10,
   fuelPriceGrowth: 0.05,
   monthlyKmPlan: 1500,
-  carPrice: 189500
+  carPrice: 189500,
+  carName: "CUPRA TERRAMAR",
+  carSubtitle: "DZIENNIK POKŁADOWY"
 };
 const KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"];
 const FUEL_TYPES = ["Pb95", "Pb98", "E10", "Inne"];
@@ -1042,103 +1044,158 @@ const toggleBtn = active => ({
   cursor: "pointer"
 });
 
-/* ---------- LIGHTWEIGHT CHARTS (no external chart library) ---------- */
-function BarChartMini({
-  data,
-  valueKey,
-  labelKey,
-  color
-}) {
-  const max = Math.max(1, ...data.map(d => d[valueKey] || 0));
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "flex-end",
-      gap: 6,
-      height: 140
-    }
-  }, data.map((d, i) => /*#__PURE__*/React.createElement("div", {
-    key: i,
-    style: {
-      flex: 1,
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      gap: 4
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      width: "100%",
-      height: 110,
-      display: "flex",
-      alignItems: "flex-end"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      width: "100%",
-      height: `${Math.max(3, d[valueKey] / max * 100)}%`,
-      background: color,
-      borderRadius: "4px 4px 0 0"
-    },
-    title: d[labelKey]
-  })), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 9,
-      color: C.textFaint
-    }
-  }, d[labelKey]))));
+/* ---------- INTERACTIVE CHART (no external chart library) ---------- */
+function niceMaxOf(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * mag;
 }
-function LineChartMini({
+function MiniChart({
   data,
   valueKey,
   labelKey,
-  color
+  type = "bar",
+  color,
+  formatValue,
+  unit
 }) {
-  const vals = data.map(d => d[valueKey]).filter(v => v !== null && v !== undefined);
-  if (!vals.length) return null;
-  const max = Math.max(...vals),
-    min = Math.min(...vals);
-  const range = max - min || 1;
-  const w = 300,
-    h = 110,
-    pad = 6;
-  const pts = data.map((d, i) => {
-    const x = pad + i / (data.length - 1 || 1) * (w - pad * 2);
-    const v = d[valueKey];
-    const y = v === null || v === undefined ? null : h - pad - (v - min) / range * (h - pad * 2);
+  const [active, setActive] = useState(null);
+  const values = data.map(d => d[valueKey]).filter(v => v !== null && v !== undefined);
+  if (!values.length) return null;
+  const fmt = formatValue || (v => num(v, 0));
+  const rawMax = Math.max(...values, 0);
+  const niceMax = niceMaxOf(rawMax * 1.1);
+  const w = 320,
+    h = 170,
+    padL = 40,
+    padR = 8,
+    padT = 10,
+    padB = 24;
+  const plotW = w - padL - padR,
+    plotH = h - padT - padB;
+  const yFor = v => padT + plotH - Math.max(0, v) / niceMax * plotH;
+  const xFor = i => padL + (data.length <= 1 ? plotW / 2 : i / (data.length - 1) * plotW);
+  const yTicks = 4;
+  const grid = Array.from({
+    length: yTicks + 1
+  }, (_, i) => {
+    const v = niceMax / yTicks * i;
     return {
-      x,
-      y,
-      label: d[labelKey],
-      v
+      v,
+      y: yFor(v)
     };
   });
-  const validPts = pts.filter(p => p.y !== null);
-  const path = validPts.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
+  const handlePick = i => setActive(prev => prev === i ? null : i);
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("svg", {
     viewBox: `0 0 ${w} ${h}`,
     width: "100%",
     height: h
-  }, /*#__PURE__*/React.createElement("path", {
-    d: path,
+  }, grid.map((g, i) => /*#__PURE__*/React.createElement("g", {
+    key: i
+  }, /*#__PURE__*/React.createElement("line", {
+    x1: padL,
+    y1: g.y,
+    x2: w - padR,
+    y2: g.y,
+    stroke: C.line,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: padL - 6,
+    y: g.y + 3,
+    fontSize: "8",
+    fill: C.textFaint,
+    textAnchor: "end"
+  }, fmt(g.v)))), type === "bar" ? data.map((d, i) => {
+    const v = d[valueKey] || 0;
+    const bw = Math.max(6, plotW / data.length * 0.55);
+    const x = xFor(i) - bw / 2;
+    const y = yFor(v);
+    const isActive = active === i;
+    return /*#__PURE__*/React.createElement("g", {
+      key: i,
+      onClick: () => handlePick(i),
+      style: {
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("rect", {
+      x: xFor(i) - plotW / data.length / 2,
+      y: padT,
+      width: plotW / data.length,
+      height: plotH,
+      fill: "transparent"
+    }), /*#__PURE__*/React.createElement("rect", {
+      x: x,
+      y: y,
+      width: bw,
+      height: Math.max(1, padT + plotH - y),
+      rx: "3",
+      fill: color,
+      opacity: isActive ? 1 : 0.78
+    }));
+  }) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("path", {
+    d: data.map((d, i) => {
+      const v = d[valueKey];
+      if (v === null || v === undefined) return null;
+      return `${i === 0 || data[i - 1][valueKey] == null ? "M" : "L"}${xFor(i)},${yFor(v)}`;
+    }).filter(Boolean).join(" "),
     fill: "none",
     stroke: color,
     strokeWidth: "2"
-  }), validPts.map((p, i) => /*#__PURE__*/React.createElement("circle", {
-    key: i,
-    cx: p.x,
-    cy: p.y,
-    r: "2.5",
-    fill: color
-  }))), /*#__PURE__*/React.createElement("div", {
+  }), data.map((d, i) => {
+    const v = d[valueKey];
+    if (v === null || v === undefined) return null;
+    const isActive = active === i;
+    return /*#__PURE__*/React.createElement("g", {
+      key: i,
+      onClick: () => handlePick(i),
+      style: {
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: xFor(i),
+      cy: yFor(v),
+      r: "11",
+      fill: "transparent"
+    }), /*#__PURE__*/React.createElement("circle", {
+      cx: xFor(i),
+      cy: yFor(v),
+      r: isActive ? 5 : 2.5,
+      fill: isActive ? C.text : color,
+      stroke: color,
+      strokeWidth: isActive ? 2 : 0
+    }));
+  })), data.map((d, i) => {
+    const show = i === 0 || i === data.length - 1 || i === active;
+    if (!show) return null;
+    return /*#__PURE__*/React.createElement("text", {
+      key: i,
+      x: xFor(i),
+      y: h - 6,
+      fontSize: "8",
+      fill: active === i ? C.text : C.textFaint,
+      textAnchor: "middle"
+    }, d[labelKey]);
+  }), active !== null && /*#__PURE__*/React.createElement("line", {
+    x1: xFor(active),
+    y1: padT,
+    x2: xFor(active),
+    y2: padT + plotH,
+    stroke: color,
+    strokeWidth: "1",
+    strokeDasharray: "3,3",
+    opacity: "0.5"
+  })), /*#__PURE__*/React.createElement("div", {
     style: {
-      display: "flex",
-      justifyContent: "space-between",
-      fontSize: 9,
-      color: C.textFaint,
-      marginTop: 2
+      textAlign: "center",
+      marginTop: 2,
+      fontSize: 12,
+      minHeight: 16,
+      fontFamily: "'JetBrains Mono', monospace",
+      color: active !== null ? C.text : "transparent"
     }
-  }, /*#__PURE__*/React.createElement("span", null, data[0][labelKey]), /*#__PURE__*/React.createElement("span", null, data[data.length - 1][labelKey])));
+  }, active !== null && data[active] ? `${data[active][labelKey]} · ${fmt(data[active][valueKey])}${unit ? " " + unit : ""}` : "—"));
 }
 
 /* ---------- GAUGE ---------- */
@@ -1378,26 +1435,43 @@ function Dashboard({
     style: {
       fontSize: 12.5,
       color: C.textDim,
-      marginBottom: 10,
+      marginBottom: 2,
       fontWeight: 600
     }
-  }, "Koszty miesięczne"), /*#__PURE__*/React.createElement(BarChartMini, {
+  }, "Koszty miesięczne"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: C.textFaint,
+      marginBottom: 6
+    }
+  }, "Stuknij słupek, żeby zobaczyć dokładną kwotę"), /*#__PURE__*/React.createElement(MiniChart, {
     data: chartData,
     valueKey: "total",
     labelKey: "label",
-    color: C.copper
+    type: "bar",
+    color: C.copper,
+    formatValue: v => `${Math.round(v)} zł`
   })), chartData.length > 1 && /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12.5,
       color: C.textDim,
-      marginBottom: 10,
+      marginBottom: 2,
       fontWeight: 600
     }
-  }, "Spalanie w czasie"), /*#__PURE__*/React.createElement(LineChartMini, {
+  }, "Spalanie w czasie"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: C.textFaint,
+      marginBottom: 6
+    }
+  }, "Stuknij punkt, żeby zobaczyć wartość dla danego miesiąca"), /*#__PURE__*/React.createElement(MiniChart, {
     data: chartData,
     valueKey: "consumption",
     labelKey: "label",
-    color: C.amber
+    type: "line",
+    color: C.amber,
+    formatValue: v => num(v, 1),
+    unit: "l/100km"
   })));
 }
 
@@ -2020,13 +2094,21 @@ function PrognozaTab({
     style: {
       fontSize: 11,
       color: C.textFaint,
-      marginBottom: 10
+      marginBottom: 6
     }
-  }, "Założenia: ", num(settings.monthlyKmPlan, 0), " km/mies., spalanie ", num(baseConsumption, 2), " l/100km, wzrost cen ", num(settings.fuelPriceGrowth * 100, 1), "%/rok"), /*#__PURE__*/React.createElement(LineChartMini, {
+  }, "Założenia: ", num(settings.monthlyKmPlan, 0), " km/mies., spalanie ", num(baseConsumption, 2), " l/100km, wzrost cen ", num(settings.fuelPriceGrowth * 100, 1), "%/rok"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: C.textFaint,
+      marginBottom: 6
+    }
+  }, "Stuknij punkt, żeby zobaczyć prognozę na dany miesiąc"), /*#__PURE__*/React.createElement(MiniChart, {
     data: rows,
     valueKey: "fuel",
     labelKey: "label",
-    color: C.copper
+    type: "line",
+    color: C.copper,
+    formatValue: v => `${Math.round(v)} zł`
   })));
 }
 
@@ -2080,6 +2162,28 @@ function UstawieniaTab({
       gap: 4
     }
   }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(Field, {
+    label: "Nazwa auta (nagłówek)"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    style: inputStyle,
+    value: local.carName,
+    onChange: e => setLocal({
+      ...local,
+      carName: e.target.value
+    }),
+    placeholder: "np. CUPRA TERRAMAR"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Podtytuł nagłówka"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    style: inputStyle,
+    value: local.carSubtitle,
+    onChange: e => setLocal({
+      ...local,
+      carSubtitle: e.target.value
+    }),
+    placeholder: "np. DZIENNIK POKŁADOWY"
+  })), /*#__PURE__*/React.createElement(Field, {
     label: "Próg spalania — OK do (l/100km)"
   }, /*#__PURE__*/React.createElement("input", {
     type: "number",
@@ -2232,6 +2336,8 @@ function CarDashboardApp() {
   } = useCarData();
   const [tab, setTab] = useState("dashboard");
   const agg = useAggregates(data || EMPTY_DATA);
+  // data is null on the first render (loaded in useEffect)
+  const settings = (data || EMPTY_DATA).settings;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       minHeight: "100vh",
@@ -2284,13 +2390,13 @@ function CarDashboardApp() {
       fontWeight: 700,
       letterSpacing: 0.2
     }
-  }, "CUPRA TERRAMAR"), /*#__PURE__*/React.createElement("div", {
+  }, settings.carName || "MOJE AUTO"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.textDim,
       letterSpacing: 1.5
     }
-  }, "DZIENNIK POKŁADOWY")))), /*#__PURE__*/React.createElement("main", {
+  }, settings.carSubtitle || "DZIENNIK POKŁADOWY")))), /*#__PURE__*/React.createElement("main", {
     style: {
       padding: "16px 16px 8px"
     }
@@ -2389,7 +2495,8 @@ function CarDashboardApp() {
 function App() {
   return /*#__PURE__*/React.createElement(ErrorBoundary, null, /*#__PURE__*/React.createElement(CarDashboardApp, null));
 }
-ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));</script>
+ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
+</script>
 <script>
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", function () {

@@ -1,4 +1,4 @@
-const CACHE = "cupra-terramar-v4";
+const CACHE = "cupra-terramar-v5";
 const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
