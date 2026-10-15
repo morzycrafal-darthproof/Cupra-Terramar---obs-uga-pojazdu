@@ -27,7 +27,7 @@ from pathlib import Path
 from tkinter import filedialog
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -149,7 +149,7 @@ DEFAULT_SETTINGS = {
     "carSubtitle": "DZIENNIK POKŁADOWY",
 }
 
-FUEL_TYPES = ["Pb95", "Pb98", "E10", "Inne"]
+FUEL_TYPES = ["Pb95", "Pb98"]
 KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"]
 
 
@@ -442,6 +442,21 @@ def icon(name, color=C["text_dim"], size=18):
     return img
 
 
+_TK_ICON_CACHE = {}
+
+
+def tk_icon(widget, name, color=C["text_dim"], size=16):
+    """The same glyph as icon(), as a PhotoImage for plain tk widgets (scaled like CTk images)."""
+    scale = ctk.ScalingTracker.get_widget_scaling(widget)
+    key = (name, color, size, scale)
+    if key not in _TK_ICON_CACHE:
+        img = icon(name, color, size)
+        px_size = round(size * scale)
+        _TK_ICON_CACHE[key] = (ImageTk.PhotoImage(img.cget("light_image").resize((px_size, px_size), Image.LANCZOS))
+                               if img is not None else None)
+    return _TK_ICON_CACHE[key]
+
+
 def asset_image(filename, height):
     path = ASSET_DIR / filename
     if not path.exists():
@@ -559,6 +574,31 @@ def icon_button(master, name, command, color=C["text_dim"], size=34):
                          fg_color="transparent", hover_color=C["surface3"], image=icon(name, color, 16))
 
 
+class ScrollArea(ctk.CTkScrollableFrame):
+    """Scrollable column whose content follows the new width only once a resize settles:
+    every row redraws its rounded background on a width change, which made dragging the window stutter."""
+
+    def __init__(self, master):
+        super().__init__(master, fg_color="transparent", scrollbar_button_color=C["line"],
+                         scrollbar_button_hover_color=C["text_faint"])
+        self._fit_job = None
+        self._fitted = False
+        self._parent_canvas.bind("<Configure>", self._fit_later)
+
+    def _fit_later(self, event):
+        if not self._fitted:  # first layout: fit at once, so the list never shows at its natural width
+            self._fitted = True
+            return self._fit_frame_dimensions_to_canvas(event)
+        if self._fit_job is not None:
+            self.after_cancel(self._fit_job)
+        self._fit_job = self.after(120, lambda: self._fit_now(event))
+
+    def _fit_now(self, event):
+        self._fit_job = None
+        if self.winfo_exists():
+            self._fit_frame_dimensions_to_canvas(event)
+
+
 def bind_tree(widget, sequence, handler):
     """Bind on a widget and all of its descendants (CTk widgets are made of several tk widgets)."""
     widget.bind(sequence, handler, add="+")
@@ -610,48 +650,78 @@ class Toast:
 # ----------------------------------------------------------------------
 # DIALOGS
 # ----------------------------------------------------------------------
+def style_titlebar(window, color):
+    """Dark title bar (Windows 10+) in the given colour (Windows 11), applied before the window is shown.
+
+    Replaces CTk's own approach, which hides and re-shows the window and makes it flash white."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        dwm = ctypes.windll.dwmapi
+        on = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (and its pre-20H1 id)
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+        r, g, b = _rgb(color)
+        colorref = ctypes.c_int(r | g << 8 | b << 16)
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(colorref), ctypes.sizeof(colorref))  # DWMWA_CAPTION_COLOR
+    except Exception:
+        pass
+
+
+def set_app_icon(window):
+    ico = ASSET_DIR / "app.ico"
+    if os.name == "nt" and ico.exists():
+        window.iconbitmap(str(ico))  # also stops CTk from installing its default icon later
+
+
 class Dialog(ctk.CTkToplevel):
     """Modal dialog centred over the main window, Esc closes."""
+    _deactivate_windows_window_header_manipulation = True  # see style_titlebar()
 
     def __init__(self, app, title, icon_name=None, width=480):
-        super().__init__(app)
+        super().__init__(app, fg_color=C["surface"])
         self.app = app
-        # hidden via alpha, not withdraw(): CTk keeps a window withdrawn after its dark-titlebar redraw
-        # if withdraw() was called, and the dialog would never appear
-        self.attributes("-alpha", 0.0)
+        self.withdraw()  # shown in _present() once laid out, so it never appears half-drawn
         self.title(title)
-        self.configure(fg_color=C["surface"])
         self.resizable(False, False)
         self.transient(app)
+        set_app_icon(self)
 
-        head = ctk.CTkFrame(self, fg_color="transparent")
+        bg = C["surface"]
+        head = tk.Frame(self, bg=bg)
         head.pack(fill="x", padx=24, pady=(20, 4))
         if icon_name:
             chip = ctk.CTkLabel(head, text="", width=36, height=36, corner_radius=10, fg_color=C["copper_soft"],
                                 image=icon(icon_name, C["copper"], 18))
             chip.pack(side="left", padx=(0, 12))
-        label(head, title, 18, weight="semibold", display=True).pack(side="left")
+        tk.Label(head, text=title, fg=C["text"], bg=bg, font=tk_font(self, 18, "semibold", True)).pack(side="left")
         icon_button(head, "close", self.close).pack(side="right")
 
-        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body = tk.Frame(self, bg=bg)
         self.body.pack(fill="both", expand=True, padx=24, pady=(8, 0))
-        ctk.CTkFrame(self.body, fg_color="transparent", width=width, height=1).pack()  # minimum width
-        self.footer = ctk.CTkFrame(self, fg_color="transparent")
+        tk.Frame(self.body, bg=bg, width=round(width * ctk.ScalingTracker.get_widget_scaling(self)),
+                 height=1).pack()  # minimum width
+        self.footer = tk.Frame(self, bg=bg)
         self.footer.pack(fill="x", padx=24, pady=(16, 20))
 
-        self.bind("<Escape>", lambda e: self.close())
+        self.bind("<Escape>", lambda e: self.on_escape())
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.after(20, self._present)
-        ico = ASSET_DIR / "app.ico"
-        if os.name == "nt" and ico.exists():
-            self.after(260, lambda: self.iconbitmap(str(ico)))  # CTkToplevel sets its own icon at ~200 ms
+        self.after(1, self._present)
+
+    def on_escape(self):
+        self.close()
 
     def _present(self):
+        style_titlebar(self, C["surface"])
         self.update_idletasks()
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
         ax, ay, aw, ah = self.app.winfo_rootx(), self.app.winfo_rooty(), self.app.winfo_width(), self.app.winfo_height()
         self.geometry(f"+{max(0, ax + (aw - w) // 2)}+{max(0, ay + (ah - h) // 3)}")
-        self.attributes("-alpha", 1.0)
+        self.deiconify()
         self.lift()
         try:
             self.grab_set()
@@ -684,11 +754,13 @@ class ConfirmDialog(Dialog):
         self.bind("<Return>", lambda e: btn.invoke())
 
 
-class CalendarPopup(Dialog):
-    """Month grid date picker; calls on_pick(iso_date)."""
+class CalendarPopover(ctk.CTkFrame):
+    """Month grid that drops down inside the form (no separate window). Day cells are plain tk.Labels:
+    42 CTk buttons took about half a second to build."""
+    BG = C["surface2"]
 
-    def __init__(self, app, initial_iso, on_pick):
-        super().__init__(app, "Wybierz datę", "calendar", width=300)
+    def __init__(self, window, anchor_widget, initial_iso, on_pick):
+        super().__init__(window, fg_color=self.BG, corner_radius=14, border_width=1, border_color=C["line"])
         try:
             d = dt.date.fromisoformat(initial_iso)
         except (TypeError, ValueError):
@@ -696,17 +768,26 @@ class CalendarPopup(Dialog):
         self.selected = d
         self.year, self.month = d.year, d.month
         self.on_pick = on_pick
-        nav = ctk.CTkFrame(self.body, fg_color="transparent")
+        inner = tk.Frame(self, bg=self.BG)
+        inner.pack(padx=12, pady=12)
+        nav = tk.Frame(inner, bg=self.BG)
         nav.pack(fill="x")
-        icon_button(nav, "prev", lambda: self.shift(-1)).pack(side="left")
-        self.title_lbl = label(nav, "", 14, weight="semibold")
+        icon_button(nav, "prev", lambda: self.shift(-1), size=30).pack(side="left")
+        self.title_lbl = tk.Label(nav, fg=C["text"], bg=self.BG, font=tk_font(self, 14, "semibold"))
         self.title_lbl.pack(side="left", expand=True)
-        icon_button(nav, "next", lambda: self.shift(1)).pack(side="right")
-        self.grid_frame = ctk.CTkFrame(self.body, fg_color="transparent")
-        self.grid_frame.pack(pady=(8, 0))
-        ghost_button(self.footer, "Dziś", lambda: self.pick(dt.date.today()), width=90).pack(side="left")
-        ghost_button(self.footer, "Anuluj", self.close, width=90).pack(side="right")
+        icon_button(nav, "next", lambda: self.shift(1), size=30).pack(side="right")
+        self.grid_frame = tk.Frame(inner, bg=self.BG)
+        self.grid_frame.pack(pady=(8, 4))
+        today = tk.Label(inner, text="Dziś", fg=C["copper"], bg=self.BG, cursor="hand2",
+                         font=tk_font(self, 12, "semibold"))
+        today.pack(anchor="w", padx=4)
+        today.bind("<Button-1>", lambda e: self.pick(dt.date.today()))
+        self._cell_font = tk_font(self, 12)
+        self._cell_bold = tk_font(self, 12, "semibold")
+        self._head_font = tk_font(self, 11)
         self.draw()
+        self.place(in_=anchor_widget, relx=1.0, rely=1.0, y=6, anchor="ne")
+        self.lift()
 
     def shift(self, delta):
         m = self.month - 1 + delta
@@ -714,7 +795,7 @@ class CalendarPopup(Dialog):
         self.draw()
 
     def pick(self, d):
-        self.close()
+        self.destroy()
         self.on_pick(d.isoformat())
 
     def draw(self):
@@ -722,48 +803,49 @@ class CalendarPopup(Dialog):
             w.destroy()
         self.title_lbl.configure(text=f"{MONTHS_FULL[self.month - 1]} {self.year}")
         for i, name in enumerate(["Pn", "Wt", "Śr", "Cz", "Pt", "Sb", "Nd"]):
-            label(self.grid_frame, name, 11, C["text_faint"], width=36).grid(row=0, column=i, pady=(0, 4))
+            tk.Label(self.grid_frame, text=name, fg=C["text_faint"], bg=self.BG, width=4,
+                     font=self._head_font).grid(row=0, column=i, pady=(0, 4))
         first = dt.date(self.year, self.month, 1)
         start = first - dt.timedelta(days=first.weekday())
         today = dt.date.today()
         for i in range(42):
             d = start + dt.timedelta(days=i)
-            in_month = d.month == self.month
             is_sel = d == self.selected
-            b = ctk.CTkButton(
-                self.grid_frame, text=str(d.day), width=36, height=32, corner_radius=8,
-                font=font(12, "semibold" if is_sel or d == today else "normal"),
-                fg_color=C["copper"] if is_sel else "transparent",
-                hover_color=C["copper_hover"] if is_sel else C["surface3"],
-                text_color="#140D08" if is_sel else (C["copper"] if d == today else
-                                                      (C["text"] if in_month else C["text_faint"])),
-                command=lambda d=d: self.pick(d))
-            b.grid(row=1 + i // 7, column=i % 7, padx=1, pady=1)
+            fg = "#140D08" if is_sel else (C["copper"] if d == today else
+                                           (C["text"] if d.month == self.month else C["text_faint"]))
+            bg = C["copper"] if is_sel else self.BG
+            cell = tk.Label(self.grid_frame, text=str(d.day), fg=fg, bg=bg, width=4, pady=5, cursor="hand2",
+                            font=self._cell_bold if is_sel or d == today else self._cell_font)
+            cell.grid(row=1 + i // 7, column=i % 7, padx=1, pady=1)
+            cell.bind("<Button-1>", lambda e, d=d: self.pick(d))
+            if not is_sel:
+                cell.bind("<Enter>", lambda e, c=cell: c.configure(bg=C["surface3"]))
+                cell.bind("<Leave>", lambda e, c=cell: c.configure(bg=self.BG))
 
 
 class Field:
-    """Labelled entry with optional unit suffix, hint and inline error message."""
+    """Labelled entry with optional unit suffix, hint and inline error message.
+    Only the entry is a CTk widget; labels and containers are plain tk (much cheaper to create)."""
 
-    def __init__(self, parent, title, value="", suffix=None, hint=None, placeholder=""):
-        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
-        top = ctk.CTkFrame(self.frame, fg_color="transparent")
+    def __init__(self, parent, title, value="", suffix=None, hint=None, placeholder="", bg=C["surface"]):
+        self.frame = tk.Frame(parent, bg=bg)
+        top = tk.Frame(self.frame, bg=bg)
         top.pack(fill="x")
-        label(top, title, 12, C["text_dim"]).pack(side="left")
+        tk.Label(top, text=title, fg=C["text_dim"], bg=bg, font=tk_font(parent, 12)).pack(side="left")
         # CTkEntry ignores placeholder_text when a textvariable is set, so the example goes next to the title
-        self.hint = label(top, hint or placeholder, 11, C["text_faint"])
+        self.hint = tk.Label(top, text=hint or placeholder, fg=C["text_faint"], bg=bg, font=tk_font(parent, 11))
         self.hint.pack(side="right")
         self.var = tk.StringVar(value=value)
-        self.row = ctk.CTkFrame(self.frame, fg_color="transparent")
+        self.row = tk.Frame(self.frame, bg=bg)
         self.row.pack(fill="x", pady=(4, 0))
         self.entry = ctk.CTkEntry(self.row, textvariable=self.var, height=40, corner_radius=10, border_width=1,
                                   fg_color=C["surface2"], border_color=C["line"], text_color=C["text"],
-                                  placeholder_text=placeholder, placeholder_text_color=C["text_faint"],
                                   font=font(14))
         self.entry.pack(side="left", fill="x", expand=True)
         if suffix:
-            label(self.entry, suffix, 12, C["text_faint"], fg_color=C["surface2"]).place(
-                relx=1.0, rely=0.5, x=-12, anchor="e")
-        self.error = label(self.frame, "", 11, C["red"])
+            tk.Label(self.entry, text=suffix, fg=C["text_faint"], bg=C["surface2"],
+                     font=tk_font(parent, 12)).place(relx=1.0, rely=0.5, x=-12, anchor="e")
+        self.error = tk.Label(self.frame, fg=C["red"], bg=bg, font=tk_font(parent, 11))
         self._has_error = False
         self.entry.bind("<FocusIn>", lambda e: self._border())
         self.entry.bind("<FocusOut>", lambda e: self._border())
@@ -816,12 +898,24 @@ class DateField(Field):
                       hover_color=C["surface3"], image=icon("calendar", C["text_dim"], 16),
                       command=self.open_calendar).pack(side="left", padx=(6, 0))
 
+        self.calendar = None
+
     def open_calendar(self):
+        if self.calendar is not None and self.calendar.winfo_exists():
+            return self.close_calendar()
         try:
             iso = parse_date(self.get())
         except ValueError:
             iso = None
-        CalendarPopup(self.app, iso, lambda v: self.set(date_fmt(v)))
+        self.calendar = CalendarPopover(self.frame.winfo_toplevel(), self.row, iso, lambda v: self.set(date_fmt(v)))
+
+    def close_calendar(self):
+        """Returns True if a calendar was open (Esc then closes only the calendar)."""
+        if self.calendar is not None and self.calendar.winfo_exists():
+            self.calendar.destroy()
+            self.calendar = None
+            return True
+        return False
 
     def value(self):
         return parse_date(self.get())
@@ -844,6 +938,12 @@ class EntryForm(Dialog):
                        width=150).pack(side="right")
         ghost_button(self.footer, "Anuluj", self.close, width=100).pack(side="right", padx=(0, 8))
         self.bind("<Return>", lambda e: self.save())
+
+    def on_escape(self):
+        f_date = getattr(self, "f_date", None)
+        if f_date is not None and f_date.close_calendar():
+            return
+        self.close()
 
     def focus_first(self):
         first = getattr(self, "first_field", None)
@@ -882,7 +982,7 @@ def required(value, message):
 
 
 def two_columns(parent):
-    row = ctk.CTkFrame(parent, fg_color="transparent")
+    row = tk.Frame(parent, bg=C["surface"])
     row.pack(fill="x")
     row.columnconfigure((0, 1), weight=1, uniform="col")
     return row
@@ -904,9 +1004,13 @@ class TankowanieForm(EntryForm):
         e = self.entry or {}
         last = max(self.app.data["tankowania"], key=lambda t: (t["date"], t["mileage"]), default=None)
         self.f_date = DateField(self.body, self.app, iso=e.get("date")).pack()
-        label(self.body, "Paliwo", 12, C["text_dim"]).pack(anchor="w")
-        self.v_fuel = tk.StringVar(value=e.get("fuelType", (last or {}).get("fuelType", "Pb98")))
-        ctk.CTkSegmentedButton(self.body, values=FUEL_TYPES, variable=self.v_fuel, height=36, corner_radius=10,
+        tk.Label(self.body, text="Paliwo", fg=C["text_dim"], bg=C["surface"],
+                 font=tk_font(self, 12)).pack(anchor="w")
+        fuel = e.get("fuelType", (last or {}).get("fuelType", "Pb98"))
+        self.v_fuel = tk.StringVar(value=fuel)
+        # an older entry may use a type that is no longer offered; keep it selectable for that entry
+        fuels = FUEL_TYPES + ([fuel] if fuel not in FUEL_TYPES else [])
+        ctk.CTkSegmentedButton(self.body, values=fuels, variable=self.v_fuel, height=36, corner_radius=10,
                                font=font(13), fg_color=C["surface2"], selected_color=C["copper"],
                                selected_hover_color=C["copper_hover"], unselected_color=C["surface2"],
                                unselected_hover_color=C["surface3"], text_color=C["text"]
@@ -924,11 +1028,13 @@ class TankowanieForm(EntryForm):
         self.summary.pack(fill="x", pady=(4, 0))
         self.summary.columnconfigure((0, 1, 2), weight=1, uniform="s")
         self.sum_vals = {}
+        bg = C["surface2"]
         for i, (key, title) in enumerate((("price", "Cena za litr"), ("dist", "Dystans"), ("cons", "Spalanie"))):
-            cell = ctk.CTkFrame(self.summary, fg_color="transparent")
+            cell = tk.Frame(self.summary, bg=bg)
             cell.grid(row=0, column=i, sticky="w", padx=14, pady=10)
-            label(cell, title, 11, C["text_faint"]).pack(anchor="w")
-            self.sum_vals[key] = label(cell, "—", 15, weight="semibold", display=True)
+            tk.Label(cell, text=title, fg=C["text_faint"], bg=bg, font=tk_font(self, 11)).pack(anchor="w")
+            self.sum_vals[key] = tk.Label(cell, text="—", fg=C["text"], bg=bg,
+                                          font=tk_font(self, 15, "semibold", True))
             self.sum_vals[key].pack(anchor="w")
         for f in (self.f_date, self.f_liters, self.f_cost, self.f_mileage):
             f.var.trace_add("write", lambda *a: self.update_summary())
@@ -954,11 +1060,11 @@ class TankowanieForm(EntryForm):
         self.f_mileage.hint.configure(text=f"poprzednio {numf(anchor['mileage'], 0)} km" if anchor else "")
         dist = mileage - prev["mileage"] if prev and mileage is not None else None
         self.sum_vals["dist"].configure(text=f"{numf(dist, 0)} km" if dist is not None else "—",
-                                        text_color=C["red"] if dist is not None and dist <= 0 else C["text"])
+                                        fg=C["red"] if dist is not None and dist <= 0 else C["text"])
         cons = liters / dist * 100 if liters and dist and dist > 0 else None
         st = status_of(cons, self.app.data["settings"])
         self.sum_vals["cons"].configure(text=f"{numf(cons, 2)} l/100" if cons else "—",
-                                        text_color=st[1] if st else C["text"])
+                                        fg=st[1] if st else C["text"])
 
     def collect(self):
         ok1, date_iso = self.check(self.f_date, self.f_date.value)
@@ -1078,9 +1184,26 @@ class ChartCard(ctk.CTkFrame):
         w = self.canvas.get_tk_widget()
         w.configure(bg=C["surface"], highlightthickness=0)
         w.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        # matplotlib redraws the whole figure on every <Configure>; while the window is being dragged
+        # that is dozens of full renders, so the resize is applied once the size settles
+        w.bind("<Configure>", self._on_configure)
+        self._resize_event = None
+        self._resize_job = None
         self.canvas.mpl_connect("motion_notify_event", self._hover)
         self.canvas.mpl_connect("figure_leave_event", lambda e: self._show_point(None))
         self.active = None
+        self._marks = None  # bar patches or the scatter collection, recoloured on hover without a rebuild
+
+    def _on_configure(self, event):
+        self._resize_event = event
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(150, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_job = None
+        if self._resize_event is not None and self.winfo_exists():
+            self.canvas.resize(self._resize_event)
 
     def set_data(self, labels, values, guides=()):
         self.labels, self.values, self.guides = labels, values, guides
@@ -1100,20 +1223,20 @@ class ChartCard(ctk.CTkFrame):
         ax.set_axisbelow(True)
         xs = list(range(len(self.values)))
         if not xs:
+            self._marks = None
             self.canvas.draw_idle()
             return
-        hi = self.active if self.active is not None else len(xs) - 1
         if self.kind == "bar":
-            colors = [self.color if i == hi else C["copper_dim"] for i in xs]
-            ax.bar(xs, self.values, color=colors, width=0.62, zorder=2)
+            self._marks = ax.bar(xs, self.values, color=C["copper_dim"], width=0.62, zorder=2).patches
         else:
             ax.fill_between(xs, self.values, min(self.values) * 0.92, color=self.color, alpha=0.10, zorder=1)
             ax.plot(xs, self.values, color=self.color, linewidth=2.2, zorder=2)
-            ax.scatter(xs, self.values, s=[42 if i == hi else 14 for i in xs], color=self.color,
-                       edgecolor=C["surface"], linewidth=1.5, zorder=3)
+            self._marks = ax.scatter(xs, self.values, s=14, color=self.color,
+                                     edgecolor=C["surface"], linewidth=1.5, zorder=3)
             lo = min(self.values + [g[0] for g in self.guides])
             top = max(self.values + [g[0] for g in self.guides])
             ax.set_ylim(lo - (top - lo) * 0.15, top + (top - lo) * 0.15)
+        self._highlight()
         for y, col in self.guides:
             ax.axhline(y, color=col, linewidth=1, linestyle=(0, (4, 4)), alpha=0.7, zorder=1)
         ax.set_xticks(xs, [l.replace(" ", "\n") for l in self.labels])
@@ -1128,10 +1251,21 @@ class ChartCard(ctk.CTkFrame):
         if 0 <= i < len(self.values):
             self._show_point(i)
 
+    def _highlight(self):
+        if not self.values or self._marks is None:
+            return
+        hi = self.active if self.active is not None else len(self.values) - 1
+        if self.kind == "bar":
+            for i, patch in enumerate(self._marks):
+                patch.set_facecolor(self.color if i == hi else C["copper_dim"])
+        else:
+            self._marks.set_sizes([42 if i == hi else 14 for i in range(len(self.values))])
+
     def _show_point(self, i):
         if i != self.active:
             self.active = i
-            self._render_chart()
+            self._highlight()
+            self.canvas.draw_idle()
         k = len(self.values) - 1 if i is None else i
         self.readout.configure(text=f"{self.labels[k]}  ·  {self.fmt(self.values[k])}" if self.values else "")
 
@@ -1267,43 +1401,87 @@ class ListPage(Page):
 
     def build(self):
         primary_button(self.actions, self.add_text, lambda: self.form(self.app), "add").pack()
-        self.list = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=C["line"],
-                                           scrollbar_button_hover_color=C["text_faint"])
+        self.list = ScrollArea(self)
         self.list.pack(fill="both", expand=True, padx=(32, 18), pady=(0, 20))
-        self.rows = {}
+        self.container = None
+        self.items = {}   # key -> (signature, widget) for what is on screen
+        self.rows = {}    # entry id -> row widget
         self._generation = 0
 
     def sort_key(self, e):
         return e["date"]
 
-    FIRST_BATCH, BATCH = 10, 8
+    def entry_by_id(self, eid):
+        return next((x for x in self.app.data[self.collection] if x["id"] == eid), None)
 
-    def refresh(self):
-        """Rebuild the list; the first rows are drawn at once, the rest in small batches so the UI stays responsive."""
-        self._generation += 1
-        gen = self._generation
-        for w in self.list.winfo_children():
-            w.destroy()
-        self.rows = {}
-        entries = sorted(self.app.data[self.collection], key=self.sort_key, reverse=True)
-        self.subtitle_lbl.configure(text=self.summary(entries))
-        if not entries:
-            label(self.list, self.empty_text, 14, C["text_faint"]).pack(pady=60)
-            return
-        jobs, month = [], None
+    FIRST_BATCH, BATCH = 10, 8
+    HEADER_PACK = dict(fill="x", pady=(14, 6), padx=(4, 16))
+    ROW_PACK = dict(fill="x", pady=(0, 6), padx=(0, 12))
+
+    def _layout(self, entries):
+        """What should be on screen, in order: (key, signature, builder, pack options)."""
+        items, month = [], None
         for e in entries:
             if month_key(e["date"]) != month:
                 month = month_key(e["date"])
                 group = [x for x in entries if month_key(x["date"]) == month]
-                jobs.append(lambda m=month, g=group: self.month_header(m, g))
-            jobs.append(lambda e=e: self.rows.__setitem__(e["id"], self.make_row(e)))
+                items.append(("h:" + month, (month, self.group_summary(group)),
+                              lambda m=month, g=group: self.month_header(m, g), self.HEADER_PACK))
+            items.append(("r:" + e["id"], (e["date"], self.row_text(e), self.row_right(e)),
+                          lambda e=e: self.make_row(e), self.ROW_PACK))
+        return items
+
+    def refresh(self):
+        """Bring the list up to date. After an edit only the rows whose content changed are rebuilt
+        (creating and destroying CTk widgets is what makes Tk slow); a first build or a large change
+        renders the first rows at once and the rest in small batches."""
+        self._generation += 1
+        gen = self._generation
+        entries = sorted(self.app.data[self.collection], key=self.sort_key, reverse=True)
+        self.subtitle_lbl.configure(text=self.summary(entries))
+        layout = self._layout(entries) if entries else []
+        changed = [it for it in layout if self.items.get(it[0], (None,))[0] != it[1]]
+
+        if self.container is None or not entries or len(changed) > self.FIRST_BATCH:
+            self._rebuild(layout, gen)
+            return
+
+        wanted = {key for key, *_ in layout}
+        for key, (sig, w) in list(self.items.items()):
+            if key not in wanted or any(key == c[0] for c in changed):
+                w.destroy()
+                del self.items[key]
+        for key, sig, builder, _ in changed:
+            self.items[key] = (sig, builder())
+        for w in self.container.pack_slaves():
+            w.pack_forget()
+        for key, _, _, pack_kw in layout:
+            self.items[key][1].pack(**pack_kw)
+        self.rows = {k[2:]: w for k, (_, w) in self.items.items() if k.startswith("r:")}
+
+    def _rebuild(self, layout, gen):
+        old = self.container
+        if old is not None:
+            old.pack_forget()
+            self.after(200, old.destroy)  # destroying many CTk widgets is slow; do it after the new list shows
+        self.container = tk.Frame(self.list, bg=C["bg"])
+        self.container.pack(fill="both", expand=True)
+        self.items, self.rows = {}, {}
+        if not layout:
+            tk.Label(self.container, text=self.empty_text, fg=C["text_faint"], bg=C["bg"],
+                     font=tk_font(self, 14)).pack(pady=60)
+            return
 
         def run(start, count):
             if gen != self._generation or not self.winfo_exists():
                 return  # a newer refresh started
-            for job in jobs[start:start + count]:
-                job()
-            if start + count < len(jobs):
+            for key, sig, builder, pack_kw in layout[start:start + count]:
+                w = builder()
+                w.pack(**pack_kw)
+                self.items[key] = (sig, w)
+                if key.startswith("r:"):
+                    self.rows[key[2:]] = w
+            if start + count < len(layout):
                 self.after(1, lambda: run(start + count, self.BATCH))
 
         run(0, self.FIRST_BATCH)
@@ -1317,17 +1495,17 @@ class ListPage(Page):
 
     def month_header(self, key, group):
         y, m = key.split("-")
-        h = tk.Frame(self.list, bg=C["bg"])
-        h.pack(fill="x", pady=(14, 6), padx=(4, 16))
+        h = tk.Frame(self.container, bg=C["bg"])
         tk.Label(h, text=f"{MONTHS_FULL[int(m) - 1]} {y}", fg=C["text_dim"], bg=C["bg"],
                  font=tk_font(h, 13, "semibold")).pack(side="left")
         tk.Label(h, text=self.group_summary(group), fg=C["text_faint"], bg=C["bg"],
                  font=tk_font(h, 12)).pack(side="right")
+        return h
 
     def make_row(self, e):
         # rounded parts are CTk widgets; plain text uses tk.Label, which is several times cheaper to create
-        row = ctk.CTkFrame(self.list, fg_color=C["surface"], corner_radius=14)
-        row.pack(fill="x", pady=(0, 6), padx=(0, 12))
+        eid = e["id"]  # handlers look the entry up by id: the row may outlive the dict (e.g. after an import)
+        row = ctk.CTkFrame(self.container, fg_color=C["surface"], corner_radius=14)
         tinted = []  # tk widgets whose background follows the row colour
 
         def tk_frame(master):
@@ -1357,9 +1535,23 @@ class ListPage(Page):
 
         actions = tk_frame(row)
         actions.pack(side="right", padx=(6, 10))
-        icon_button(actions, "edit", lambda: self.form(self.app, e)).pack(side="left")
-        icon_button(actions, "delete", lambda: self.app.confirm_delete(self.collection, e),
-                    color=C["text_faint"]).pack(side="left", padx=(2, 0))
+        buttons = []
+        def edit():
+            current = self.entry_by_id(eid)
+            if current is not None:
+                self.form(self.app, current)
+
+        def delete():
+            current = self.entry_by_id(eid)
+            if current is not None:
+                self.app.confirm_delete(self.collection, current)
+
+        for name, cmd, color in (("edit", edit, C["text_dim"]), ("delete", delete, C["text_faint"])):
+            b = tk.Label(actions, image=tk_icon(row, name, color), bg=C["surface"], cursor="hand2", padx=9, pady=9)
+            b.pack(side="left", padx=(4, 0))
+            b.bind("<Button-1>", lambda ev, cmd=cmd: cmd())
+            tinted.append(b)
+            buttons.append(b)
 
         right = tk_frame(row)
         right.pack(side="right", padx=(10, 4))
@@ -1368,13 +1560,18 @@ class ListPage(Page):
         if badge:
             pill(right, *badge).pack(anchor="e", pady=(3, 0))
 
+        state = {"bg": C["surface"]}
+
         def paint(color):
+            if state["bg"] == color:
+                return
+            state["bg"] = color
             row.configure(fg_color=color)
             for w in tinted:
                 w.configure(bg=color)
-            for b in actions.winfo_children() + right.winfo_children():
-                if isinstance(b, ctk.CTkBaseClass):
-                    b.configure(bg_color=color)
+            for w in right.winfo_children():
+                if isinstance(w, ctk.CTkBaseClass):
+                    w.configure(bg_color=color)
 
         def enter(_):
             paint(C["surface3"])
@@ -1386,8 +1583,11 @@ class ListPage(Page):
 
         bind_tree(row, "<Enter>", enter)
         bind_tree(row, "<Leave>", leave)
-        bind_tree(mid, "<Double-Button-1>", lambda ev: self.form(self.app, e))
-        bind_tree(db, "<Double-Button-1>", lambda ev: self.form(self.app, e))
+        for b in buttons:  # bound after the row handlers so the button highlight wins
+            b.bind("<Enter>", lambda ev, b=b: b.configure(bg=C["line"]), add="+")
+            b.bind("<Leave>", lambda ev, b=b: b.configure(bg=state["bg"]), add="+")
+        bind_tree(mid, "<Double-Button-1>", lambda ev: edit())
+        bind_tree(db, "<Double-Button-1>", lambda ev: edit())
         return row
 
 
@@ -1533,8 +1733,7 @@ class UstawieniaPage(Page):
 
     def build(self):
         primary_button(self.actions, "Zapisz ustawienia", self.save, "check").pack()
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=C["line"],
-                                        scrollbar_button_hover_color=C["text_faint"])
+        scroll = ScrollArea(self)
         scroll.pack(fill="both", expand=True, padx=(32, 18), pady=(0, 20))
         grid = ctk.CTkFrame(scroll, fg_color="transparent")
         grid.pack(fill="x", padx=(0, 12))
@@ -1620,10 +1819,12 @@ class CarApp(ctk.CTk):
     PAGES = [("dashboard", "Pulpit", "home", DashboardPage), ("tankowania", "Tankowania", "fuel", TankowaniaPage),
              ("serwisy", "Serwisy", "wrench", SerwisyPage), ("koszty", "Koszty", "card", KosztyPage),
              ("prognoza", "Prognoza", "chart", PrognozaPage), ("ustawienia", "Ustawienia", "settings", UstawieniaPage)]
+    _deactivate_windows_window_header_manipulation = True  # see style_titlebar()
 
     def __init__(self):
         ctk.set_appearance_mode("dark")
         super().__init__(fg_color=C["bg"])
+        self.withdraw()  # shown at the end of __init__, fully built and with the dark title bar
         self.data = load_data()
         self.title("Cupra Terramar — Dziennik pokładowy")
         scale = ctk.ScalingTracker.get_window_scaling(self)
@@ -1646,15 +1847,17 @@ class CarApp(ctk.CTk):
         self.content.grid_columnconfigure(0, weight=1)
 
         self.pages = {}
+        # only the visible page is gridded: hidden pages would otherwise be re-laid out (charts included)
+        # on every window resize
         for key, _, _, cls in self.PAGES:
-            page = cls(self)
-            page.grid(row=0, column=0, sticky="nsew")
-            self.pages[key] = page
+            self.pages[key] = cls(self)
         self.dirty = set(self.pages)
         self.current = None
         self.toast = Toast(self)
         self.bind("<Control-n>", lambda e: self.new_entry())
         self.show("dashboard")
+        style_titlebar(self, C["bg"])
+        self.deiconify()
 
     # ---------------- layout ----------------
     def _build_sidebar(self):
@@ -1698,19 +1901,26 @@ class CarApp(ctk.CTk):
                                    if self.data["settings"]["carName"].isupper() else self.data["settings"]["carName"])
         self.brand_sub.configure(text=self.data["settings"]["carSubtitle"])
 
+    def _style_nav(self, key, active):
+        b, ic = self.nav[key]
+        b.configure(fg_color=C["copper_soft"] if active else "transparent",
+                    text_color=C["text"] if active else C["text_dim"],
+                    image=icon(ic, C["copper"] if active else C["text_dim"], 18),
+                    font=font(14, "semibold" if active else "normal"))
+
     def show(self, key):
-        for k, (b, ic) in self.nav.items():
-            active = k == key
-            b.configure(fg_color=C["copper_soft"] if active else "transparent",
-                        text_color=C["text"] if active else C["text_dim"],
-                        image=icon(ic, C["copper"] if active else C["text_dim"], 18),
-                        font=font(14, "semibold" if active else "normal"))
+        previous = self.current
+        if previous != key:
+            if previous is not None:
+                self._style_nav(previous, False)
+                self.pages[previous].grid_remove()
+            self._style_nav(key, True)
         self.current = key
         page = self.pages[key]
         if key in self.dirty:
             page.refresh()
             self.dirty.discard(key)
-        page.tkraise()
+        page.grid(row=0, column=0, sticky="nsew")
 
     def new_entry(self):
         forms = {"tankowania": TankowanieForm, "serwisy": SerwisForm, "koszty": KosztForm}
