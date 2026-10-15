@@ -76,6 +76,13 @@ _RAW_TANKOWANIA = [
     ("2026-07-21", "Pb98", 46.98, 389.46, 17675, 582),
     ("2026-07-23", "Pb98", 49.75, 392.03, 18226, 551),
     ("2026-08-02", "Pb98", 52.29, 426.69, 18807, 581),
+    ("2026-08-09", "Pb98", 47.53, 377.39, 19386, 579),
+    ("2026-08-17", "Pb98", 53.83, 387.43, 20016, 630),
+    ("2026-08-26", "Pb98", 49.09, 362.82, 20609, 593),
+    ("2026-09-13", "Pb98", 47.63, 421.05, 21063, 454),
+    ("2026-09-22", "Pb98", 51.58, 455.98, 21680, 617),
+    ("2026-10-02", "Pb98", 51.34, 451.55, 22280, 600),
+    ("2026-10-10", "Pb98", 53.97, 408.66, 22880, 600),
 ]
 
 
@@ -97,6 +104,9 @@ def _seed_serwisy():
          "price": 0, "warranty": True, "paidCost": 0, "note": "W cenie zakupu auta"},
         {"id": "seed-s-1", "date": "2026-04-28", "mileage": 13150, "description": "Wymiana opon",
          "price": 250, "warranty": False, "paidCost": 250, "note": ""},
+        {"id": "seed-s-2", "date": "2026-08-11", "mileage": 19531,
+         "description": "Olej + filtr oleju + filtr powietrza + filtr kabinowy + śruba spustu oleju",
+         "price": 932.5, "warranty": False, "paidCost": 932.5, "note": "Serwis w Bosh Dunst Kartuzy"},
     ]
 
 
