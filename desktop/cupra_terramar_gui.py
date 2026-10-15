@@ -48,6 +48,28 @@ C = {
 FONT_FAMILY = "Segoe UI" if os.name == "nt" else "Helvetica"
 FONT_MONO = "Consolas" if os.name == "nt" else "Courier"
 
+# Screen pixels per logical (96 dpi) pixel; set once the Tk root exists.
+UI_SCALE = 1.0
+
+
+def px(n):
+    """Scale a pixel size designed at 96 dpi to the current display."""
+    return int(round(n * UI_SCALE))
+
+
+def enable_dpi_awareness():
+    """Without this, Windows bitmap-stretches the window on scaled displays (blurry text)."""
+    if os.name != "nt":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 # ----------------------------------------------------------------------
 # DATA FILE + SEED DATA (imported from CupraTerramar.xlsx)
 # ----------------------------------------------------------------------
@@ -232,6 +254,25 @@ def new_id():
     return uuid.uuid4().hex[:8]
 
 
+def recalc_tankowania(tankowania):
+    """Distance and consumption follow from the mileage difference to the previous fill-up (as in the xlsx)."""
+    prev = None
+    for t in sorted(tankowania, key=lambda t: (t["date"], t["mileage"])):
+        distance = t["mileage"] - prev["mileage"] if prev else None
+        t["distance"] = distance
+        t["consumption"] = round(t["liters"] / distance * 100, 2) if distance and distance > 0 else None
+        prev = t
+
+
+def num_in(v):
+    """Number -> text for a form field (Polish decimal comma)."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).replace(".", ",")
+
+
 # ----------------------------------------------------------------------
 # AGGREGATION
 # ----------------------------------------------------------------------
@@ -327,27 +368,38 @@ def setup_style(root):
     style.configure("TNotebook", background=C["bg"], borderwidth=0,
                      bordercolor=C["bg"], darkcolor=C["bg"], lightcolor=C["bg"])
     style.configure("TNotebook.Tab", background=C["surface"], foreground=C["text_dim"],
-                     padding=(14, 8), font=(FONT_FAMILY, 10, "bold"), borderwidth=0)
+                     padding=(px(14), px(8)), font=(FONT_FAMILY, 10, "bold"), borderwidth=0)
     style.map("TNotebook.Tab",
               background=[("selected", C["copper"])],
               foreground=[("selected", "#100C09")])
 
     style.configure("Copper.TButton", background=C["copper"], foreground="#100C09",
-                     font=(FONT_FAMILY, 10, "bold"), padding=(12, 8), borderwidth=0)
+                     font=(FONT_FAMILY, 10, "bold"), padding=(px(12), px(8)), borderwidth=0)
     style.map("Copper.TButton", background=[("active", "#dd7a3f")])
     style.configure("Ghost.TButton", background=C["bg"], foreground=C["text"],
-                     font=(FONT_FAMILY, 10), padding=(12, 8), borderwidth=1)
+                     font=(FONT_FAMILY, 10), padding=(px(12), px(8)), borderwidth=1)
     style.map("Ghost.TButton", background=[("active", C["surface"])])
     style.configure("Danger.TButton", background=C["surface"], foreground=C["red"],
-                     font=(FONT_FAMILY, 9), padding=(6, 4), borderwidth=0)
+                     font=(FONT_FAMILY, 9), padding=(px(6), px(4)), borderwidth=0)
 
     style.configure("TEntry", fieldbackground=C["surface2"], foreground=C["text"],
                      insertcolor=C["text"], borderwidth=1)
-    style.configure("TCombobox", fieldbackground=C["surface2"], foreground=C["text"], background=C["surface2"])
+    style.configure("TCombobox", fieldbackground=C["surface2"], foreground=C["text"], background=C["surface2"],
+                     arrowcolor=C["text_dim"], bordercolor=C["line"])
+    # clam paints readonly comboboxes light grey by default
+    style.map("TCombobox",
+              fieldbackground=[("readonly", C["surface2"])],
+              foreground=[("readonly", C["text"])],
+              selectbackground=[("readonly", C["surface2"])],
+              selectforeground=[("readonly", C["text"])],
+              background=[("readonly", C["surface2"]), ("active", C["surface"])])
+    root.option_add("*TCombobox*Listbox.background", C["surface2"])
+    root.option_add("*TCombobox*Listbox.foreground", C["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", C["copper_dim"])
     style.configure("TCheckbutton", background=C["surface"], foreground=C["text"])
 
     style.configure("Treeview", background=C["surface"], fieldbackground=C["surface"],
-                     foreground=C["text"], rowheight=26, borderwidth=0, font=(FONT_FAMILY, 9))
+                     foreground=C["text"], rowheight=px(26), borderwidth=0, font=(FONT_FAMILY, 9))
     style.configure("Treeview.Heading", background=C["surface2"], foreground=C["text_dim"],
                      font=(FONT_FAMILY, 9, "bold"), borderwidth=0)
     style.map("Treeview", background=[("selected", C["copper_dim"])])
@@ -382,7 +434,7 @@ class ScrollableFrame(ttk.Frame):
 
 class Card(ttk.Frame):
     def __init__(self, parent, **kw):
-        super().__init__(parent, style="Surface.TFrame", padding=14, **kw)
+        super().__init__(parent, style="Surface.TFrame", padding=px(14), **kw)
 
 
 class KPI(Card):
@@ -395,7 +447,7 @@ class KPI(Card):
 class Pill(tk.Label):
     def __init__(self, parent, text, color, **kw):
         super().__init__(parent, text=text, fg=color, bg=C["surface"],
-                          font=(FONT_FAMILY, 8, "bold"), padx=8, pady=2, **kw)
+                          font=(FONT_FAMILY, 8, "bold"), padx=px(8), pady=px(2), **kw)
 
 
 def styled_entry(parent, textvariable=None, width=20):
@@ -419,29 +471,30 @@ def field(parent, label_text, widget_factory):
 # ----------------------------------------------------------------------
 class GaugeCanvas(tk.Canvas):
     def __init__(self, parent, size=150, **kw):
+        size = px(size)
         super().__init__(parent, width=size, height=size, bg=C["surface"], highlightthickness=0, **kw)
         self.size = size
 
     def draw(self, value, settings):
         self.delete("all")
         s = self.size
-        pad = 14
+        pad = px(14)
         status = status_of(value, settings)
         color = status[1] if status else C["text_faint"]
         high = settings["consumptionHighFrom"]
         vmax = max(high * 1.4, (value * 1.15) if value else 12)
         pct = min(value / vmax, 1) if value else 0
 
-        self.create_oval(pad, pad, s - pad, s - pad, outline=C["line"], width=10)
+        self.create_oval(pad, pad, s - pad, s - pad, outline=C["line"], width=px(10))
         if pct > 0:
             self.create_arc(pad, pad, s - pad, s - pad, start=90, extent=-360 * pct,
-                             style="arc", outline=color, width=10)
+                             style="arc", outline=color, width=px(10))
 
-        self.create_text(s / 2, s / 2 - 10, text=(numf(value, 1) if value else "—"),
+        self.create_text(s / 2, s / 2 - px(10), text=(numf(value, 1) if value else "—"),
                           fill=C["text"], font=(FONT_MONO, 20, "bold"))
-        self.create_text(s / 2, s / 2 + 14, text="l / 100km", fill=C["text_dim"], font=(FONT_FAMILY, 8))
+        self.create_text(s / 2, s / 2 + px(14), text="l / 100km", fill=C["text_dim"], font=(FONT_FAMILY, 8))
         if status:
-            self.create_text(s / 2, s / 2 + 32, text=status[0], fill=color, font=(FONT_FAMILY, 8, "bold"))
+            self.create_text(s / 2, s / 2 + px(32), text=status[0], fill=color, font=(FONT_FAMILY, 8, "bold"))
 
 
 # ----------------------------------------------------------------------
@@ -450,15 +503,19 @@ class GaugeCanvas(tk.Canvas):
 class CarApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        global UI_SCALE
+        UI_SCALE = self.winfo_fpixels("1i") / 96
         self.data = load_data()
         self.title("Dziennik pokładowy")
-        self.geometry("880x680")
-        self.minsize(760, 560)
+        w = min(px(880), int(self.winfo_screenwidth() * 0.95))
+        h = min(px(680), int(self.winfo_screenheight() * 0.88))
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(px(760), w), min(px(560), h))
         self.style = setup_style(self)
 
         self._build_header()
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.notebook.pack(fill="both", expand=True, padx=px(12), pady=(0, px(12)))
 
         self.tab_dashboard = ttk.Frame(self.notebook, style="TFrame")
         self.tab_tankowania = ttk.Frame(self.notebook, style="TFrame")
@@ -501,11 +558,42 @@ class CarApp(tk.Tk):
         [self.refresh_dashboard, self.refresh_tankowania, self.refresh_serwisy,
          self.refresh_koszty, self.refresh_prognoza, lambda: None][idx]()
 
+    # ---------------- shared form / list helpers ----------------
+    def form_window(self, title, width, height):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=C["surface2"])
+        win.geometry(f"{px(width)}x{px(height)}")
+        win.transient(self)
+        win.grab_set()  # modal: one form at a time
+        return win
+
+    def edit_selected(self, tree, collection, open_form):
+        sel = tree.selection()
+        if len(sel) != 1:
+            messagebox.showinfo("Edycja", "Zaznacz jeden wpis do edycji.")
+            return
+        entry = next((e for e in self.data[collection] if e["id"] == sel[0]), None)
+        if entry is not None:
+            open_form(entry)
+
+    def bind_row_double_click(self, tree, handler):
+        def on_double(event):
+            if tree.identify_row(event.y):  # ignore double clicks on headings
+                handler()
+        tree.bind("<Double-1>", on_double)
+
+    @staticmethod
+    def reselect(tree, iid):
+        if tree.exists(iid):
+            tree.selection_set(iid)
+            tree.see(iid)
+
     # ---------------- header ----------------
     def _build_header(self):
         header = tk.Frame(self, bg=C["bg"])
-        header.pack(fill="x", padx=16, pady=(16, 8))
-        badge = tk.Frame(header, bg=C["copper_dim"], width=42, height=42)
+        header.pack(fill="x", padx=px(16), pady=(px(16), px(8)))
+        badge = tk.Frame(header, bg=C["copper_dim"], width=px(42), height=px(42))
         badge.pack(side="left")
         badge.pack_propagate(False)
         tk.Label(badge, text="⛟", bg=C["copper_dim"], fg=C["copper"], font=(FONT_FAMILY, 18)).pack(expand=True)
@@ -523,7 +611,7 @@ class CarApp(tk.Tk):
 
     # ---------------- DASHBOARD ----------------
     def _build_dashboard(self):
-        outer = ttk.Frame(self.tab_dashboard, style="TFrame", padding=12)
+        outer = ttk.Frame(self.tab_dashboard, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         top = ttk.Frame(outer, style="TFrame")
@@ -550,18 +638,22 @@ class CarApp(tk.Tk):
         kpi_grid.columnconfigure(0, weight=1)
         kpi_grid.columnconfigure(1, weight=1)
 
+        # side by side: stacked charts do not fit the window height on scaled displays
         charts = ttk.Frame(outer, style="TFrame")
         charts.pack(fill="both", expand=True, pady=(10, 0))
+        charts.columnconfigure(0, weight=1, uniform="chart")
+        charts.columnconfigure(1, weight=1, uniform="chart")
+        charts.rowconfigure(0, weight=1)
 
-        self.fig_cost = Figure(figsize=(5.2, 2.1), dpi=100, facecolor=C["surface"])
+        self.fig_cost = Figure(figsize=(4.2, 2.4), dpi=100, facecolor=C["surface"])
         self.ax_cost = self.fig_cost.add_subplot(111)
         self.canvas_cost = FigureCanvasTkAgg(self.fig_cost, master=charts)
-        self.canvas_cost.get_tk_widget().pack(fill="both", expand=True, pady=(0, 8))
+        self.canvas_cost.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=(0, px(4)))
 
-        self.fig_cons = Figure(figsize=(5.2, 2.1), dpi=100, facecolor=C["surface"])
+        self.fig_cons = Figure(figsize=(4.2, 2.4), dpi=100, facecolor=C["surface"])
         self.ax_cons = self.fig_cons.add_subplot(111)
         self.canvas_cons = FigureCanvasTkAgg(self.fig_cons, master=charts)
-        self.canvas_cons.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas_cons.get_tk_widget().grid(row=0, column=1, sticky="nsew", padx=(px(4), 0))
 
     def _style_ax(self, ax, fig):
         fig.patch.set_facecolor(C["surface"])
@@ -571,6 +663,7 @@ class CarApp(tk.Tk):
             spine.set_color(C["line"])
         ax.grid(True, color=C["line"], linewidth=0.6, axis="y")
         ax.set_axisbelow(True)
+        fig.subplots_adjust(bottom=0.2)  # room for two-line month labels
 
     def refresh_dashboard(self):
         agg = compute_aggregates(self.data)
@@ -593,24 +686,31 @@ class CarApp(tk.Tk):
         self._style_ax(self.ax_cost, self.fig_cost)
         self.ax_cost.set_title("Koszty miesięczne", color=C["text_dim"], fontsize=9, loc="left")
         if monthly:
-            labels = [m["label"] for m in monthly]
-            vals = [m["total"] for m in monthly]
-            self.ax_cost.bar(labels, vals, color=C["copper"])
+            xs = range(len(monthly))
+            self.ax_cost.bar(xs, [m["total"] for m in monthly], color=C["copper"])
+            self.ax_cost.set_xticks(xs, [self._tick_label(m["label"]) for m in monthly])
         self.canvas_cost.draw()
 
         self.ax_cons.clear()
         self._style_ax(self.ax_cons, self.fig_cons)
         self.ax_cons.set_title("Spalanie w czasie (l/100km)", color=C["text_dim"], fontsize=9, loc="left")
-        cons_pts = [(m["label"], m["consumption"]) for m in monthly if m["consumption"] is not None]
+        cons_pts = [m for m in monthly if m["consumption"] is not None]
         if len(cons_pts) > 1:
-            labels = [p[0] for p in cons_pts]
-            vals = [p[1] for p in cons_pts]
-            self.ax_cons.plot(labels, vals, color=C["amber"], marker="o", markersize=4, linewidth=2)
+            xs = range(len(cons_pts))
+            self.ax_cons.plot(xs, [m["consumption"] for m in cons_pts], color=C["amber"],
+                              marker="o", markersize=4, linewidth=2)
+            self.ax_cons.set_xticks(xs, [self._tick_label(m["label"]) for m in cons_pts])
         self.canvas_cons.draw()
+
+    @staticmethod
+    def _tick_label(label):
+        # "sty 26" -> "sty\n26": full labels overlap in half-width charts; numeric x positions
+        # keep months of different years apart
+        return label.replace(" ", "\n")
 
     # ---------------- TANKOWANIA ----------------
     def _build_tankowania(self):
-        outer = ttk.Frame(self.tab_tankowania, style="TFrame", padding=12)
+        outer = ttk.Frame(self.tab_tankowania, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         bar = ttk.Frame(outer, style="TFrame")
@@ -625,7 +725,7 @@ class CarApp(tk.Tk):
         self.tank_tree = ttk.Treeview(outer, columns=cols, show="headings", height=14)
         for c, h in zip(cols, headers):
             self.tank_tree.heading(c, text=h)
-            self.tank_tree.column(c, width=90, anchor="center")
+            self.tank_tree.column(c, width=px(90), anchor="center")
         self.tank_tree.pack(fill="both", expand=True)
         self.tank_tree.tag_configure("high", foreground=C["red"])
         self.tank_tree.tag_configure("warn", foreground=C["amber"])
@@ -633,8 +733,11 @@ class CarApp(tk.Tk):
 
         btns = ttk.Frame(outer, style="TFrame")
         btns.pack(fill="x", pady=(6, 0))
+        edit = lambda: self.edit_selected(self.tank_tree, "tankowania", self.open_tankowanie_form)
+        ttk.Button(btns, text="Edytuj zaznaczone", style="Ghost.TButton", command=edit).pack(side="left")
         ttk.Button(btns, text="Usuń zaznaczone", style="Ghost.TButton",
-                   command=self.delete_tankowanie).pack(side="left")
+                   command=self.delete_tankowanie).pack(side="left", padx=(px(6), 0))
+        self.bind_row_double_click(self.tank_tree, edit)
 
     def refresh_tankowania(self):
         for row in self.tank_tree.get_children():
@@ -663,66 +766,75 @@ class CarApp(tk.Tk):
             return
         ids = set(sel)
         self.data["tankowania"] = [t for t in self.data["tankowania"] if t["id"] not in ids]
+        recalc_tankowania(self.data["tankowania"])
         self.persist()
         self.refresh_tankowania()
         self.refresh_dashboard()
 
-    def open_tankowanie_form(self):
-        win = tk.Toplevel(self)
-        win.title("Nowe tankowanie")
-        win.configure(bg=C["surface2"])
-        win.geometry("340x420")
+    def open_tankowanie_form(self, entry=None):
+        """Add a new fill-up, or edit `entry` in place when given."""
+        win = self.form_window("Edycja tankowania" if entry else "Nowe tankowanie", 340, 420)
 
-        last = sorted(self.data["tankowania"], key=lambda t: t["date"], reverse=True)
-        last_mileage = last[0]["mileage"] if last else 0
+        # previous fill-up: the one before `entry`, or the latest one for a new entry
+        before = [t for t in self.data["tankowania"] if t is not entry and
+                  (entry is None or (t["date"], t["mileage"]) < (entry["date"], entry["mileage"]))]
+        prev = max(before, key=lambda t: (t["date"], t["mileage"]), default=None)
 
-        v_date = tk.StringVar(value=dt.date.today().isoformat())
-        v_fuel = tk.StringVar(value="Pb98")
-        v_liters = tk.StringVar()
-        v_cost = tk.StringVar()
-        v_mileage = tk.StringVar()
-        v_note = tk.StringVar()
+        e = entry or {}
+        v_date = tk.StringVar(value=e.get("date", dt.date.today().isoformat()))
+        v_fuel = tk.StringVar(value=e.get("fuelType", "Pb98"))
+        v_liters = tk.StringVar(value=num_in(e.get("liters")))
+        v_cost = tk.StringVar(value=num_in(e.get("cost")))
+        v_mileage = tk.StringVar(value=num_in(e.get("mileage")))
+        v_note = tk.StringVar(value=e.get("note", ""))
 
-        pad = ttk.Frame(win, style="Surface.TFrame", padding=16)
+        pad = ttk.Frame(win, style="Surface.TFrame", padding=px(16))
         pad.pack(fill="both", expand=True)
 
         field(pad, "Data (RRRR-MM-DD)", lambda p: styled_entry(p, v_date))
-        cb = field(pad, "Paliwo", lambda p: ttk.Combobox(p, textvariable=v_fuel, values=FUEL_TYPES, state="readonly"))
+        field(pad, "Paliwo", lambda p: ttk.Combobox(p, textvariable=v_fuel, values=FUEL_TYPES, state="readonly"))
         field(pad, "Litry", lambda p: styled_entry(p, v_liters))
         field(pad, "Koszt (zł)", lambda p: styled_entry(p, v_cost))
-        field(pad, f"Przebieg (km) — ostatni: {numf(last_mileage,0)}", lambda p: styled_entry(p, v_mileage))
+        prev_txt = f" — poprzedni: {numf(prev['mileage'], 0)}" if prev else ""
+        field(pad, f"Przebieg (km){prev_txt}", lambda p: styled_entry(p, v_mileage))
         field(pad, "Notatka (opcjonalnie)", lambda p: styled_entry(p, v_note))
 
         def save():
             try:
                 liters = float(v_liters.get().replace(",", "."))
                 cost = float(v_cost.get().replace(",", "."))
-                mileage = int(v_mileage.get())
+                mileage = int(v_mileage.get().replace(" ", ""))
                 date_s = v_date.get().strip()
                 dt.datetime.strptime(date_s, "%Y-%m-%d")
+                if liters <= 0:
+                    raise ValueError
             except Exception:
-                messagebox.showerror("Błąd", "Sprawdź poprawność danych (data RRRR-MM-DD, liczby w litrach/koszcie/przebiegu).")
+                messagebox.showerror("Błąd", "Sprawdź poprawność danych (data RRRR-MM-DD, liczby w litrach/koszcie/przebiegu).",
+                                     parent=win)
                 return
-            distance = mileage - last_mileage if last else None
-            consumption = round(liters / distance * 100, 2) if distance and distance > 0 else None
-            entry = {
-                "id": new_id(), "date": date_s, "fuelType": v_fuel.get(), "liters": liters, "cost": cost,
-                "pricePerL": round(cost / liters, 3), "mileage": mileage, "distance": distance,
-                "consumption": consumption, "note": v_note.get(),
+            values = {
+                "date": date_s, "fuelType": v_fuel.get(), "liters": liters, "cost": cost,
+                "pricePerL": round(cost / liters, 3), "mileage": mileage, "note": v_note.get(),
             }
-            self.data["tankowania"].append(entry)
+            target = entry if entry is not None else {"id": new_id()}
+            target.update(values)
+            if entry is None:
+                self.data["tankowania"].append(target)
+            recalc_tankowania(self.data["tankowania"])
             self.persist()
             self.refresh_tankowania()
             self.refresh_dashboard()
+            self.reselect(self.tank_tree, target["id"])
             win.destroy()
 
         btn_row = ttk.Frame(pad, style="Surface.TFrame")
         btn_row.pack(fill="x", pady=(12, 0))
-        ttk.Button(btn_row, text="Zapisz", style="Copper.TButton", command=save).pack(fill="x")
+        ttk.Button(btn_row, text="Zapisz zmiany" if entry else "Zapisz", style="Copper.TButton",
+                   command=save).pack(fill="x")
 
     # ---------------- SERWISY ----------------
     def _build_serwisy(self):
-        outer = ttk.Frame(self.tab_serwisy, style="TFrame", padding=12)
+        outer = ttk.Frame(self.tab_serwisy, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         bar = ttk.Frame(outer, style="TFrame")
@@ -737,13 +849,16 @@ class CarApp(tk.Tk):
         self.serw_tree = ttk.Treeview(outer, columns=cols, show="headings", height=14)
         for c, h, w in zip(cols, headers, (90, 90, 240, 90, 90)):
             self.serw_tree.heading(c, text=h)
-            self.serw_tree.column(c, width=w, anchor="center" if c != "desc" else "w")
+            self.serw_tree.column(c, width=px(w), anchor="center" if c != "desc" else "w")
         self.serw_tree.pack(fill="both", expand=True)
 
         btns = ttk.Frame(outer, style="TFrame")
         btns.pack(fill="x", pady=(6, 0))
+        edit = lambda: self.edit_selected(self.serw_tree, "serwisy", self.open_serwis_form)
+        ttk.Button(btns, text="Edytuj zaznaczone", style="Ghost.TButton", command=edit).pack(side="left")
         ttk.Button(btns, text="Usuń zaznaczone", style="Ghost.TButton",
-                   command=self.delete_serwis).pack(side="left")
+                   command=self.delete_serwis).pack(side="left", padx=(px(6), 0))
+        self.bind_row_double_click(self.serw_tree, edit)
 
     def refresh_serwisy(self):
         for row in self.serw_tree.get_children():
@@ -768,20 +883,19 @@ class CarApp(tk.Tk):
         self.refresh_serwisy()
         self.refresh_dashboard()
 
-    def open_serwis_form(self):
-        win = tk.Toplevel(self)
-        win.title("Nowy wpis serwisowy")
-        win.configure(bg=C["surface2"])
-        win.geometry("340x420")
+    def open_serwis_form(self, entry=None):
+        """Add a new service entry, or edit `entry` in place when given."""
+        win = self.form_window("Edycja wpisu serwisowego" if entry else "Nowy wpis serwisowy", 340, 440)
 
-        v_date = tk.StringVar(value=dt.date.today().isoformat())
-        v_mileage = tk.StringVar()
-        v_desc = tk.StringVar()
-        v_price = tk.StringVar()
-        v_warranty = tk.BooleanVar(value=False)
-        v_note = tk.StringVar()
+        e = entry or {}
+        v_date = tk.StringVar(value=e.get("date", dt.date.today().isoformat()))
+        v_mileage = tk.StringVar(value=num_in(e.get("mileage")))
+        v_desc = tk.StringVar(value=e.get("description", ""))
+        v_price = tk.StringVar(value=num_in(e.get("price")))
+        v_warranty = tk.BooleanVar(value=e.get("warranty", False))
+        v_note = tk.StringVar(value=e.get("note", ""))
 
-        pad = ttk.Frame(win, style="Surface.TFrame", padding=16)
+        pad = ttk.Frame(win, style="Surface.TFrame", padding=px(16))
         pad.pack(fill="both", expand=True)
 
         field(pad, "Data (RRRR-MM-DD)", lambda p: styled_entry(p, v_date))
@@ -795,32 +909,38 @@ class CarApp(tk.Tk):
 
         def save():
             try:
-                price = float(v_price.get().replace(",", ".")) if v_price.get() else 0.0
+                price = float(v_price.get().replace(",", ".")) if v_price.get().strip() else 0.0
+                mileage_s = v_mileage.get().replace(" ", "")
+                mileage = int(mileage_s) if mileage_s else None
                 date_s = v_date.get().strip()
                 dt.datetime.strptime(date_s, "%Y-%m-%d")
             except Exception:
-                messagebox.showerror("Błąd", "Sprawdź poprawność danych.")
+                messagebox.showerror("Błąd", "Sprawdź poprawność danych.", parent=win)
                 return
             if not v_desc.get().strip():
-                messagebox.showerror("Błąd", "Podaj opis wykonanej czynności.")
+                messagebox.showerror("Błąd", "Podaj opis wykonanej czynności.", parent=win)
                 return
-            entry = {
-                "id": new_id(), "date": date_s,
-                "mileage": int(v_mileage.get()) if v_mileage.get().strip() else None,
+            values = {
+                "date": date_s, "mileage": mileage,
                 "description": v_desc.get().strip(), "price": price, "warranty": v_warranty.get(),
                 "paidCost": 0 if v_warranty.get() else price, "note": v_note.get(),
             }
-            self.data["serwisy"].append(entry)
+            target = entry if entry is not None else {"id": new_id()}
+            target.update(values)
+            if entry is None:
+                self.data["serwisy"].append(target)
             self.persist()
             self.refresh_serwisy()
             self.refresh_dashboard()
+            self.reselect(self.serw_tree, target["id"])
             win.destroy()
 
-        ttk.Button(pad, text="Zapisz", style="Copper.TButton", command=save).pack(fill="x", pady=(12, 0))
+        ttk.Button(pad, text="Zapisz zmiany" if entry else "Zapisz", style="Copper.TButton",
+                   command=save).pack(fill="x", pady=(12, 0))
 
     # ---------------- KOSZTY ----------------
     def _build_koszty(self):
-        outer = ttk.Frame(self.tab_koszty, style="TFrame", padding=12)
+        outer = ttk.Frame(self.tab_koszty, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         bar = ttk.Frame(outer, style="TFrame")
@@ -835,13 +955,16 @@ class CarApp(tk.Tk):
         self.koszt_tree = ttk.Treeview(outer, columns=cols, show="headings", height=14)
         for c, h, w in zip(cols, headers, (90, 120, 260, 100)):
             self.koszt_tree.heading(c, text=h)
-            self.koszt_tree.column(c, width=w, anchor="center" if c != "desc" else "w")
+            self.koszt_tree.column(c, width=px(w), anchor="center" if c != "desc" else "w")
         self.koszt_tree.pack(fill="both", expand=True)
 
         btns = ttk.Frame(outer, style="TFrame")
         btns.pack(fill="x", pady=(6, 0))
+        edit = lambda: self.edit_selected(self.koszt_tree, "koszty", self.open_koszt_form)
+        ttk.Button(btns, text="Edytuj zaznaczone", style="Ghost.TButton", command=edit).pack(side="left")
         ttk.Button(btns, text="Usuń zaznaczone", style="Ghost.TButton",
-                   command=self.delete_koszt).pack(side="left")
+                   command=self.delete_koszt).pack(side="left", padx=(px(6), 0))
+        self.bind_row_double_click(self.koszt_tree, edit)
 
     def refresh_koszty(self):
         for row in self.koszt_tree.get_children():
@@ -865,48 +988,54 @@ class CarApp(tk.Tk):
         self.refresh_koszty()
         self.refresh_dashboard()
 
-    def open_koszt_form(self):
-        win = tk.Toplevel(self)
-        win.title("Nowy koszt")
-        win.configure(bg=C["surface2"])
-        win.geometry("340x360")
+    def open_koszt_form(self, entry=None):
+        """Add a new cost, or edit `entry` in place when given."""
+        win = self.form_window("Edycja kosztu" if entry else "Nowy koszt", 340, 420)
 
-        v_date = tk.StringVar(value=dt.date.today().isoformat())
-        v_type = tk.StringVar(value="Inne")
-        v_desc = tk.StringVar()
-        v_amount = tk.StringVar()
+        e = entry or {}
+        v_date = tk.StringVar(value=e.get("date", dt.date.today().isoformat()))
+        v_type = tk.StringVar(value=e.get("type", "Inne"))
+        v_desc = tk.StringVar(value=e.get("description", ""))
+        v_amount = tk.StringVar(value=num_in(e.get("amount")))
+        v_note = tk.StringVar(value=e.get("note", ""))
 
-        pad = ttk.Frame(win, style="Surface.TFrame", padding=16)
+        pad = ttk.Frame(win, style="Surface.TFrame", padding=px(16))
         pad.pack(fill="both", expand=True)
 
         field(pad, "Data (RRRR-MM-DD)", lambda p: styled_entry(p, v_date))
         field(pad, "Typ kosztu", lambda p: ttk.Combobox(p, textvariable=v_type, values=KOSZTY_TYPES, state="readonly"))
         field(pad, "Opis", lambda p: styled_entry(p, v_desc))
         field(pad, "Kwota (zł)", lambda p: styled_entry(p, v_amount))
+        field(pad, "Notatka (opcjonalnie)", lambda p: styled_entry(p, v_note))
 
         def save():
             try:
-                amount = float(v_amount.get().replace(",", "."))
+                amount = float(v_amount.get().replace(",", ".").replace(" ", ""))
                 date_s = v_date.get().strip()
                 dt.datetime.strptime(date_s, "%Y-%m-%d")
             except Exception:
-                messagebox.showerror("Błąd", "Sprawdź poprawność danych.")
+                messagebox.showerror("Błąd", "Sprawdź poprawność danych.", parent=win)
                 return
-            entry = {
-                "id": new_id(), "date": date_s, "type": v_type.get(),
-                "description": v_desc.get().strip() or v_type.get(), "amount": amount, "note": "",
+            values = {
+                "date": date_s, "type": v_type.get(),
+                "description": v_desc.get().strip() or v_type.get(), "amount": amount, "note": v_note.get(),
             }
-            self.data["koszty"].append(entry)
+            target = entry if entry is not None else {"id": new_id()}
+            target.update(values)
+            if entry is None:
+                self.data["koszty"].append(target)
             self.persist()
             self.refresh_koszty()
             self.refresh_dashboard()
+            self.reselect(self.koszt_tree, target["id"])
             win.destroy()
 
-        ttk.Button(pad, text="Zapisz", style="Copper.TButton", command=save).pack(fill="x", pady=(12, 0))
+        ttk.Button(pad, text="Zapisz zmiany" if entry else "Zapisz", style="Copper.TButton",
+                   command=save).pack(fill="x", pady=(12, 0))
 
     # ---------------- PROGNOZA ----------------
     def _build_prognoza(self):
-        outer = ttk.Frame(self.tab_prognoza, style="TFrame", padding=12)
+        outer = ttk.Frame(self.tab_prognoza, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         kpi_row = ttk.Frame(outer, style="TFrame")
@@ -916,7 +1045,7 @@ class CarApp(tk.Tk):
         self.prog_kpi_avg = KPI(kpi_row, "Śr. miesięcznie", "—")
         self.prog_kpi_avg.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        self.prog_assump = ttk.Label(outer, text="", style="Faint.TLabel", wraplength=760)
+        self.prog_assump = ttk.Label(outer, text="", style="Faint.TLabel", wraplength=px(760))
         self.prog_assump.pack(anchor="w", pady=(10, 4))
 
         self.fig_prog = Figure(figsize=(6, 2.6), dpi=100, facecolor=C["surface"])
@@ -966,7 +1095,7 @@ class CarApp(tk.Tk):
     def _build_ustawienia(self):
         scroll = ScrollableFrame(self.tab_ustawienia)
         scroll.pack(fill="both", expand=True)
-        outer = ttk.Frame(scroll.inner, style="TFrame", padding=12)
+        outer = ttk.Frame(scroll.inner, style="TFrame", padding=px(12))
         outer.pack(fill="both", expand=True)
 
         card = Card(outer)
@@ -998,7 +1127,7 @@ class CarApp(tk.Tk):
                   font=(FONT_FAMILY, 11, "bold")).pack(anchor="w")
         ttk.Label(backup_card,
                   text="Dane są zapisane lokalnie w pliku na tym komputerze:\n" + DATA_FILE,
-                  style="Dim.TLabel", wraplength=600, justify="left").pack(anchor="w", pady=(4, 10))
+                  style="Dim.TLabel", wraplength=px(600), justify="left").pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(backup_card, style="Surface.TFrame")
         row.pack(fill="x")
         ttk.Button(row, text="Eksportuj kopię (.json)", style="Ghost.TButton",
@@ -1065,5 +1194,6 @@ class CarApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    enable_dpi_awareness()
     app = CarApp()
     app.mainloop()
