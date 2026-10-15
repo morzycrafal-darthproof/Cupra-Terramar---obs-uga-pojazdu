@@ -306,7 +306,7 @@ const SEED_SETTINGS = {
   carSubtitle: "DZIENNIK POKŁADOWY"
 };
 const KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"];
-const FUEL_TYPES = ["Pb95", "Pb98", "E10", "Inne"];
+const FUEL_TYPES = ["Pb95", "Pb98"];
 
 /* ---------- HELPERS ---------- */
 const pln = n => (n ?? 0).toLocaleString("pl-PL", {
@@ -439,7 +439,11 @@ function useCarData() {
     }
   }, []);
   const setData = useCallback(next => {
-    const clean = sanitize(next);
+    const sane = sanitize(next);
+    const clean = {
+      ...sane,
+      tankowania: recalcTankowania(sane.tankowania)
+    };
     setDataState(clean);
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
@@ -552,7 +556,9 @@ function KPI({
   icon: Ico,
   label,
   value,
-  accent
+  accent,
+  sub,
+  valueColor
 }) {
   return (
     <Card
@@ -582,11 +588,22 @@ function KPI({
           fontFamily: "'JetBrains Mono', monospace",
           fontSize: 21,
           fontWeight: 600,
-          color: C.text
+          color: valueColor || C.text
         }}
       >
         {value}
       </div>
+      {sub && (
+        <div
+          style={{
+            fontSize: 11,
+            color: C.textFaint,
+            marginTop: -2
+          }}
+        >
+          {sub}
+        </div>
+      )}
     </Card>
   );
 }
@@ -951,6 +968,7 @@ function ConsumptionGauge({
   const status = statusOf(value, settings);
   const color = status ? status.color : C.textFaint;
   return (
+    <>
     <div
       style={{
         position: "relative",
@@ -1011,17 +1029,19 @@ function ConsumptionGauge({
         >
           l / 100km
         </div>
-        {status && (
-          <div
-            style={{
-              marginTop: 4
-            }}
-          >
-            <Pill text={status.label} color={status.color} />
-          </div>
-        )}
       </div>
     </div>
+    {status && (
+      // below the ring: the longer labels ("Podwyższone") would overlap the arc inside it
+      <div
+        style={{
+          marginTop: 8
+        }}
+      >
+        <Pill text={STATUS_TEXT[status.label]} color={status.color} />
+      </div>
+    )}
+    </>
   );
 }
 
@@ -1125,9 +1145,13 @@ function useAggregates(data) {
 /* ---------- TAB: DASHBOARD ---------- */
 function Dashboard({
   agg,
-  settings
+  settings,
+  tankowania
 }) {
   const chartData = agg.monthly.filter(m => m.total > 0);
+  const lastFill = [...tankowania].sort(byDateMileage).pop();
+  const fuelPerKm = agg.totalDistance ? agg.totalFuelCost / agg.totalDistance : null;
+  const ls = agg.lastService;
   return (
     <div
       style={{
@@ -1163,28 +1187,43 @@ function Dashboard({
           gap: 10
         }}
       >
-        <KPI icon={Icon.money} label="Koszt całkowity" value={pln(agg.totalCost)} />
-        <KPI icon={Icon.gauge} label="Dystans" value={`${num(agg.totalDistance, 0)} km`} />
+        <KPI
+          icon={Icon.money}
+          label="Koszt całkowity"
+          value={pln(agg.totalCost)}
+          sub={`paliwo ${pln(agg.totalFuelCost)}`}
+        />
+        <KPI
+          icon={Icon.gauge}
+          label="Dystans"
+          value={`${num(agg.totalDistance, 0)} km`}
+          sub={plural(tankowania.length, "tankowanie", "tankowania", "tankowań")}
+        />
         <KPI
           icon={Icon.trend}
           label="Koszt / km"
           value={agg.costPerKm ? `${num(agg.costPerKm, 2)} zł` : "—"}
+          sub={fuelPerKm ? `samo paliwo ${num(fuelPerKm, 2)} zł` : null}
         />
         <KPI
           icon={Icon.drop}
           label="Śr. cena / l"
           value={agg.avgPricePerL ? `${num(agg.avgPricePerL, 2)} zł` : "—"}
+          sub={lastFill ? `ostatnio ${num(lastFill.pricePerL, 2)} zł` : null}
         />
         <KPI
           icon={Icon.alert}
           label="Alerty spalania"
           value={agg.alerts}
           accent={agg.alerts ? C.red : C.green}
+          valueColor={agg.alerts ? C.red : null}
+          sub={`≥ ${num(settings.consumptionHighFrom, 1)} l/100km`}
         />
         <KPI
           icon={Icon.shield}
           label="Ostatni serwis"
-          value={agg.lastService ? dateFmt(agg.lastService.date) : "—"}
+          value={ls ? dateFmt(ls.date) : "—"}
+          sub={ls ? [ls.mileage ? `${num(ls.mileage, 0)} km` : null, ls.warranty ? "gwarancja" : pln(ls.price)].filter(Boolean).join(" · ") : null}
         />
       </div>
       {chartData.length > 0 && (
@@ -1254,722 +1293,1335 @@ function Dashboard({
   );
 }
 
-/* ---------- TAB: TANKOWANIA ---------- */
-function TankowaniaTab({
-  data,
-  setData
-}) {
-  const [open, setOpen] = useState(false);
-  const {
-    tankowania,
-    settings
-  } = data;
-  const sorted = [...tankowania].sort((a, b) => a.date < b.date ? 1 : -1);
-  const lastMileage = sorted[0]?.mileage || "";
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      fuelType: "Pb98",
-      liters: "",
-      cost: "",
-      mileage: ""
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    const liters = parseFloat(form.liters),
-      cost = parseFloat(form.cost),
-      mileage = parseInt(form.mileage, 10);
-    if (!liters || !cost || !mileage || !form.date) return;
-    const prev = sorted[0];
-    const distance = prev && prev.mileage ? mileage - prev.mileage : null;
-    const consumption = distance && distance > 0 ? +(liters / distance * 100).toFixed(2) : null;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      fuelType: form.fuelType,
-      liters,
-      cost,
-      pricePerL: +(cost / liters).toFixed(3),
-      mileage,
-      distance,
-      consumption,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      tankowania: [...tankowania, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    tankowania: tankowania.filter(t => t.id !== id)
+/* ---------- FORM HELPERS ---------- */
+const MONTHS_FULL = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"];
+const MONTHS_SHORT = ["sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz", "paź", "lis", "gru"];
+const STATUS_TEXT = {
+  OK: "W normie",
+  Uwaga: "Podwyższone",
+  Wysokie: "Wysokie"
+};
+const plural = (n, one, few, many) => {
+  if (n === 1) return `${n} ${one}`;
+  const few_ = n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14);
+  return `${n} ${few_ ? few : many}`;
+};
+const localIso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const todayIso = (daysAgo = 0) => {
+  const d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  return localIso(d);
+};
+const numIn = v => v === null || v === undefined ? "" : String(v).replace(".", ",");
+
+// "1 234,5" -> 1234.5; throws an Error with a message shown under the field
+function parseNumber(raw, {
+  integer = false,
+  optional = false,
+  min = null
+} = {}) {
+  const s = String(raw ?? "").replace(/[\s ]/g, "").replace(",", ".");
+  if (!s) {
+    if (optional) return null;
+    throw new Error("To pole jest wymagane");
+  }
+  if (!(integer ? /^-?\d+$/ : /^-?\d+(\.\d+)?$/).test(s)) {
+    throw new Error(integer ? "Wpisz liczbę całkowitą" : "Wpisz liczbę, np. 52,4");
+  }
+  const v = integer ? parseInt(s, 10) : parseFloat(s);
+  if (min !== null && v < min) throw new Error(`Wartość musi być ≥ ${num(min, 0)}`);
+  return v;
+}
+const tryNumber = (raw, opts) => {
+  try {
+    return parseNumber(raw, opts);
+  } catch (e) {
+    return null;
+  }
+};
+
+// runs every rule, collecting values and per-field error messages
+function validate(rules) {
+  const values = {},
+    errors = {};
+  Object.entries(rules).forEach(([key, fn]) => {
+    try {
+      values[key] = fn();
+    } catch (e) {
+      errors[key] = e.message;
+    }
   });
+  return {
+    values,
+    errors,
+    ok: Object.keys(errors).length === 0
+  };
+}
+const byDateMileage = (a, b) => a.date === b.date ? a.mileage - b.mileage : a.date < b.date ? -1 : 1;
+
+// distance and consumption follow from the mileage difference to the previous fill-up (as in the xlsx)
+function recalcTankowania(list) {
+  const order = list.map((t, i) => [t, i]).sort((a, b) => byDateMileage(a[0], b[0]));
+  const out = list.slice();
+  let prev = null;
+  order.forEach(([t, i]) => {
+    const distance = prev ? t.mileage - prev.mileage : null;
+    const consumption = distance && distance > 0 ? +(t.liters / distance * 100).toFixed(2) : null;
+    out[i] = t.distance === distance && t.consumption === consumption ? t : {
+      ...t,
+      distance,
+      consumption
+    };
+    prev = t;
+  });
+  return out;
+}
+const upsertEntry = (data, coll, entry, values) => ({
+  ...data,
+  [coll]: entry ? data[coll].map(x => x.id === entry.id ? {
+    ...x,
+    ...values
+  } : x) : [...data[coll], {
+    id: uid(),
+    ...values
+  }]
+});
+const removeEntry = (data, coll, entry) => ({
+  ...data,
+  [coll]: data[coll].filter(x => x.id !== entry.id)
+});
+
+/* ---------- FORM PRIMITIVES ---------- */
+function FormField({
+  label,
+  hint,
+  error,
+  children
+}) {
   return (
-    <div>
+    <div
+      style={{
+        marginBottom: 12
+      }}
+    >
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12
+          fontSize: 12,
+          color: C.textDim,
+          marginBottom: 5
         }}
       >
+        <span>{label}</span>
+        {hint && (
+          <span
+            style={{
+              color: C.textFaint,
+              fontSize: 11
+            }}
+          >
+            {hint}
+          </span>
+        )}
+      </div>
+      {children}
+      {error && (
         <div
           style={{
-            color: C.textDim,
-            fontSize: 12
+            color: C.red,
+            fontSize: 11.5,
+            marginTop: 4
           }}
         >
-          {sorted.length}
-          {" tankowań · ostatni przebieg "}
-          {num(lastMileage, 0)}
-          {" km"}
+          {error}
         </div>
-        <button onClick={startNew} style={addBtnStyle}>
-          <Icon.plus />
-          Dodaj
+      )}
+    </div>
+  );
+}
+function TextInput({
+  value,
+  onChange,
+  suffix,
+  error,
+  inputMode = "text",
+  placeholder
+}) {
+  return (
+    <div
+      style={{
+        position: "relative"
+      }}
+    >
+      <input
+        type="text"
+        inputMode={inputMode}
+        value={value}
+        placeholder={placeholder}
+        onChange={e => onChange(e.target.value)}
+        style={{
+          ...inputStyle,
+          border: `1px solid ${error ? C.red : C.line}`,
+          paddingRight: suffix ? 44 : 12
+        }}
+      />
+      {suffix && (
+        <span
+          style={{
+            position: "absolute",
+            right: 12,
+            top: "50%",
+            transform: "translateY(-50%)",
+            color: C.textFaint,
+            fontSize: 12,
+            pointerEvents: "none"
+          }}
+        >
+          {suffix}
+        </span>
+      )}
+    </div>
+  );
+}
+function DateInput({
+  value,
+  onChange,
+  error
+}) {
+  const chip = (text, daysAgo) => {
+    const iso = todayIso(daysAgo);
+    return (
+      <button
+        type="button"
+        onClick={() => onChange(iso)}
+        style={{
+          ...toggleBtn(value === iso),
+          flex: "none",
+          padding: "9px 12px"
+        }}
+      >
+        {text}
+      </button>
+    );
+  };
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 6
+      }}
+    >
+      <input
+        type="date"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        style={{
+          ...inputStyle,
+          flex: 1,
+          minWidth: 0,
+          border: `1px solid ${error ? C.red : C.line}`,
+          colorScheme: "dark"
+        }}
+      />
+      {chip("Dziś", 0)}
+      {chip("Wczoraj", 1)}
+    </div>
+  );
+}
+function Segmented({
+  options,
+  value,
+  onChange
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 6
+      }}
+    >
+      {options.map(o => (
+        <button key={o} type="button" onClick={() => onChange(o)} style={toggleBtn(o === value)}>
+          {o}
         </button>
+      ))}
+    </div>
+  );
+}
+function SwitchRow({
+  label,
+  sub,
+  checked,
+  onChange
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      style={{
+        width: "100%",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        background: C.bg,
+        border: `1px solid ${C.line}`,
+        borderRadius: 12,
+        padding: "10px 12px",
+        marginBottom: 12,
+        cursor: "pointer",
+        textAlign: "left"
+      }}
+    >
+      <span>
+        <span
+          style={{
+            display: "block",
+            color: C.text,
+            fontSize: 13.5,
+            fontWeight: 600
+          }}
+        >
+          {label}
+        </span>
+        <span
+          style={{
+            display: "block",
+            color: C.textFaint,
+            fontSize: 11
+          }}
+        >
+          {sub}
+        </span>
+      </span>
+      <span
+        style={{
+          width: 42,
+          height: 24,
+          borderRadius: 99,
+          background: checked ? C.copper : C.line,
+          position: "relative",
+          transition: "background .2s",
+          flex: "none"
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            top: 3,
+            left: checked ? 21 : 3,
+            width: 18,
+            height: 18,
+            borderRadius: 99,
+            background: C.text,
+            transition: "left .2s"
+          }}
+        />
+      </span>
+    </button>
+  );
+}
+function SummaryBox({
+  items
+}) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: `repeat(${items.length}, 1fr)`,
+        background: C.bg,
+        border: `1px solid ${C.line}`,
+        borderRadius: 12,
+        padding: "10px 12px",
+        marginBottom: 8
+      }}
+    >
+      {items.map(([label, value, color]) => (
+        <div key={label}>
+          <div
+            style={{
+              fontSize: 10.5,
+              color: C.textFaint
+            }}
+          >
+            {label}
+          </div>
+          <div
+            style={{
+              fontFamily: "'Space Grotesk', sans-serif",
+              fontWeight: 700,
+              fontSize: 15,
+              color: color || C.text,
+              marginTop: 2
+            }}
+          >
+            {value}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+function ConfirmSheet({
+  title,
+  message,
+  confirmText,
+  danger = true,
+  onConfirm,
+  onCancel
+}) {
+  return (
+    <SheetModal title={title} onClose={onCancel}>
+      <div
+        style={{
+          color: C.textDim,
+          fontSize: 13.5,
+          lineHeight: 1.5,
+          marginBottom: 16
+        }}
+      >
+        {message}
       </div>
       <div
         style={{
           display: "flex",
-          flexDirection: "column",
           gap: 8
         }}
       >
-        {sorted.map(t => {
-          const status = statusOf(t.consumption, settings);
-          return (
-            <Card
-              key={t.id}
+        <button
+          type="button"
+          onClick={onCancel}
+          style={{
+            ...toggleBtn(false),
+            padding: 12,
+            color: C.text
+          }}
+        >
+          Anuluj
+        </button>
+        <button
+          type="button"
+          onClick={onConfirm}
+          style={{
+            ...toggleBtn(false),
+            padding: 12,
+            background: danger ? C.red : C.copper,
+            border: "none",
+            color: danger ? "#FFFFFF" : "#100C09"
+          }}
+        >
+          {confirmText}
+        </button>
+      </div>
+    </SheetModal>
+  );
+}
+
+// add/edit sheet with Anuluj / Zapisz and, when editing, Usuń behind a confirmation
+function EntrySheet({
+  title,
+  entry,
+  deleteLabel,
+  onClose,
+  onSave,
+  onDelete,
+  children
+}) {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <>
+      <SheetModal title={title} onClose={onClose}>
+        {children}
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            marginTop: 8,
+            alignItems: "center"
+          }}
+        >
+          {entry && (
+            <button
+              type="button"
+              onClick={() => setConfirming(true)}
               style={{
-                padding: 12
+                background: "none",
+                border: "none",
+                color: C.red,
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: 13.5,
+                padding: "10px 4px",
+                cursor: "pointer"
               }}
             >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "flex-start"
-                }}
-              >
-                <div>
-                  <div
-                    style={{
-                      color: C.text,
-                      fontWeight: 600,
-                      fontSize: 14
-                    }}
-                  >
-                    {t.fuelType}
-                    {" · "}
-                    {num(t.liters, 2)}
-                    {" l"}
-                  </div>
-                  <div
-                    style={{
-                      color: C.textDim,
-                      fontSize: 12
-                    }}
-                  >
-                    {dateFmt(t.date)}
-                    {" · "}
-                    {num(t.mileage, 0)}
-                    {" km"}
-                    {t.distance ? ` (+${num(t.distance, 0)} km)` : ""}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    textAlign: "right"
-                  }}
-                >
-                  <div
-                    style={{
-                      color: C.text,
-                      fontFamily: "'JetBrains Mono', monospace",
-                      fontWeight: 600
-                    }}
-                  >
-                    {pln(t.cost)}
-                  </div>
-                  <div
-                    style={{
-                      color: C.textFaint,
-                      fontSize: 11
-                    }}
-                  >
-                    {num(t.pricePerL, 2)}
-                    {" zł/l"}
-                  </div>
-                </div>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  marginTop: 8
-                }}
-              >
-                {status ? (
-                  <Pill
-                    text={`${num(t.consumption, 2)} l/100km · ${status.label}`}
-                    color={status.color}
-                  />
-                ) : <span />}
-                {!t.id.startsWith("seed") && (
-                  <button onClick={() => remove(t.id)} style={trashBtn}>
-                    <Icon.trash />
-                  </button>
-                )}
-              </div>
-            </Card>
-          );
-        })}
+              <Icon.trash />
+              Usuń
+            </button>
+          )}
+          <div
+            style={{
+              flex: 1
+            }}
+          />
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              ...toggleBtn(false),
+              flex: "none",
+              padding: "12px 16px",
+              color: C.text
+            }}
+          >
+            Anuluj
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            style={{
+              ...addBtnStyle,
+              padding: "12px 18px",
+              fontSize: 14
+            }}
+          >
+            {entry ? "Zapisz zmiany" : "Zapisz"}
+          </button>
+        </div>
+      </SheetModal>
+      {confirming && (
+        <ConfirmSheet
+          title="Usunąć wpis?"
+          message={`Czy na pewno usunąć ${deleteLabel}? Tej operacji nie można cofnąć.`}
+          confirmText="Usuń"
+          onCancel={() => setConfirming(false)}
+          onConfirm={onDelete}
+        />
+      )}
+    </>
+  );
+}
+
+/* ---------- LISTS ---------- */
+function ListHeader({
+  text,
+  onAdd
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 4,
+        gap: 10
+      }}
+    >
+      <div
+        style={{
+          color: C.textDim,
+          fontSize: 12
+        }}
+      >
+        {text}
       </div>
-      {open && (
-        <SheetModal title="Nowe tankowanie" onClose={() => setOpen(false)}>
-          <Field label="Data">
-            <input
-              type="date"
-              style={inputStyle}
-              value={form.date}
-              onChange={e => setForm({
-                ...form,
-                date: e.target.value
-              })}
-            />
-          </Field>
-          <Field label="Paliwo">
-            <select
-              style={inputStyle}
-              value={form.fuelType}
-              onChange={e => setForm({
-                ...form,
-                fuelType: e.target.value
-              })}
-            >
-              {FUEL_TYPES.map(f => (
-                <option key={f} value={f}>
-                  {f}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Litry">
-            <input
-              type="number"
-              inputMode="decimal"
-              style={inputStyle}
-              value={form.liters}
-              onChange={e => setForm({
-                ...form,
-                liters: e.target.value
-              })}
-              placeholder="np. 52.30"
-            />
-          </Field>
-          <Field label="Koszt (zł)">
-            <input
-              type="number"
-              inputMode="decimal"
-              style={inputStyle}
-              value={form.cost}
-              onChange={e => setForm({
-                ...form,
-                cost: e.target.value
-              })}
-              placeholder="np. 410.50"
-            />
-          </Field>
-          <Field label="Przebieg (km)">
-            <input
-              type="number"
-              inputMode="numeric"
-              style={inputStyle}
-              value={form.mileage}
-              onChange={e => setForm({
-                ...form,
-                mileage: e.target.value
-              })}
-              placeholder={`ostatni: ${lastMileage}`}
-            />
-          </Field>
-          <Field label="Notatka (opcjonalnie)">
-            <input
-              type="text"
-              style={inputStyle}
-              value={form.note || ""}
-              onChange={e => setForm({
-                ...form,
-                note: e.target.value
-              })}
-            />
-          </Field>
-          <PrimaryButton onClick={save} disabled={!form.liters || !form.cost || !form.mileage}>
-            Zapisz tankowanie
-          </PrimaryButton>
-        </SheetModal>
+      <button onClick={onAdd} style={addBtnStyle}>
+        <Icon.plus />
+        Dodaj
+      </button>
+    </div>
+  );
+}
+function EmptyList({
+  text
+}) {
+  return (
+    <div
+      style={{
+        textAlign: "center",
+        color: C.textFaint,
+        fontSize: 13,
+        padding: "48px 0"
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+// newest first, grouped by month with a per-month summary
+function MonthGroups({
+  entries,
+  compare,
+  groupSummary,
+  renderRow
+}) {
+  const sorted = [...entries].sort((a, b) => -compare(a, b));
+  const groups = [];
+  sorted.forEach(e => {
+    const k = monthKey(e.date);
+    if (!groups.length || groups[groups.length - 1].key !== k) groups.push({
+      key: k,
+      items: []
+    });
+    groups[groups.length - 1].items.push(e);
+  });
+  return groups.map(g => {
+    const [y, m] = g.key.split("-");
+    return (
+      <div key={g.key}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            padding: "14px 2px 7px"
+          }}
+        >
+          <span
+            style={{
+              color: C.textDim,
+              fontSize: 12.5,
+              fontWeight: 600
+            }}
+          >
+            {MONTHS_FULL[+m - 1]} {y}
+          </span>
+          <span
+            style={{
+              color: C.textFaint,
+              fontSize: 11.5
+            }}
+          >
+            {groupSummary(g.items)}
+          </span>
+        </div>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 8
+          }}
+        >
+          {g.items.map(renderRow)}
+        </div>
+      </div>
+    );
+  });
+}
+function EntryRow({
+  date,
+  title,
+  sub,
+  amount,
+  badge,
+  onOpen
+}) {
+  const [, m, d] = date.split("-").map(Number);
+  return (
+    <Card
+      onClick={onOpen}
+      style={{
+        padding: 10,
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        cursor: "pointer"
+      }}
+    >
+      <div
+        style={{
+          width: 46,
+          height: 46,
+          borderRadius: 10,
+          background: C.surface2,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          flex: "none"
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "'Space Grotesk', sans-serif",
+            fontWeight: 700,
+            fontSize: 17,
+            lineHeight: 1,
+            color: C.text
+          }}
+        >
+          {d}
+        </div>
+        <div
+          style={{
+            fontSize: 9.5,
+            color: C.textFaint,
+            marginTop: 3
+          }}
+        >
+          {MONTHS_SHORT[m - 1]}
+        </div>
+      </div>
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0
+        }}
+      >
+        <div
+          style={{
+            color: C.text,
+            fontWeight: 600,
+            fontSize: 14,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis"
+          }}
+        >
+          {title}
+        </div>
+        <div
+          style={{
+            color: C.textDim,
+            fontSize: 12,
+            marginTop: 2,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis"
+          }}
+        >
+          {sub}
+        </div>
+      </div>
+      <div
+        style={{
+          textAlign: "right",
+          flex: "none"
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "'JetBrains Mono', monospace",
+            fontWeight: 600,
+            color: C.text,
+            fontSize: 13.5
+          }}
+        >
+          {amount}
+        </div>
+        {badge && (
+          <div
+            style={{
+              marginTop: 4
+            }}
+          >
+            <Pill text={badge.text} color={badge.color} />
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+const sumBy = (list, key) => list.reduce((s, x) => s + (x[key] || 0), 0);
+
+/* ---------- TAB: TANKOWANIA ---------- */
+function TankowaniaTab({
+  data,
+  setData,
+  notify
+}) {
+  const {
+    tankowania,
+    settings
+  } = data;
+  const [editing, setEditing] = useState(null);
+  return (
+    <div>
+      <ListHeader
+        text={tankowania.length ? `${plural(tankowania.length, "tankowanie", "tankowania", "tankowań")} · ${pln(sumBy(tankowania, "cost"))}` : ""}
+        onAdd={() => setEditing({
+          entry: null
+        })}
+      />
+      {tankowania.length === 0 ? <EmptyList text="Brak tankowań — dodaj pierwsze." /> : (
+        <MonthGroups
+          entries={tankowania}
+          compare={byDateMileage}
+          groupSummary={g => `${num(sumBy(g, "liters"), 1)} l · ${pln(sumBy(g, "cost"))}`}
+          renderRow={t => {
+            const st = statusOf(t.consumption, settings);
+            return (
+              <EntryRow
+                key={t.id}
+                date={t.date}
+                title={`${t.fuelType} · ${num(t.liters, 2)} l`}
+                sub={`${num(t.mileage, 0)} km${t.distance ? ` (+${num(t.distance, 0)} km)` : ""} · ${num(t.pricePerL, 2)} zł/l${t.note ? ` · ${t.note}` : ""}`}
+                amount={pln(t.cost)}
+                badge={st && {
+                  text: `${num(t.consumption, 2)} l/100`,
+                  color: st.color
+                }}
+                onOpen={() => setEditing({
+                  entry: t
+                })}
+              />
+            );
+          }}
+        />
+      )}
+      {editing && (
+        <TankowanieSheet
+          data={data}
+          setData={setData}
+          notify={notify}
+          entry={editing.entry}
+          onClose={() => setEditing(null)}
+        />
       )}
     </div>
+  );
+}
+function TankowanieSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const latest = [...data.tankowania].sort(byDateMileage).pop();
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    fuelType: entry.fuelType,
+    liters: numIn(entry.liters),
+    cost: numIn(entry.cost),
+    mileage: String(entry.mileage),
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    fuelType: latest?.fuelType || "Pb98",
+    liters: "",
+    cost: "",
+    mileage: "",
+    note: ""
+  });
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  // an older entry may use a fuel type that is no longer offered; keep it selectable for that entry
+  const fuels = FUEL_TYPES.includes(f.fuelType) ? FUEL_TYPES : [...FUEL_TYPES, f.fuelType];
+
+  // live preview of price per litre, distance and consumption
+  const others = data.tankowania.filter(t => !entry || t.id !== entry.id);
+  const previousOf = (date, mileage) => others.filter(t => byDateMileage(t, {
+    date,
+    mileage
+  }) < 0).sort(byDateMileage).pop();
+  const liters = tryNumber(f.liters),
+    cost = tryNumber(f.cost),
+    mileage = tryNumber(f.mileage, {
+      integer: true
+    });
+  const prev = f.date && mileage !== null ? previousOf(f.date, mileage) : null;
+  const hintPrev = prev || (entry ? previousOf(entry.date, entry.mileage) : latest);
+  const dist = prev && mileage !== null ? mileage - prev.mileage : null;
+  const cons = liters && dist > 0 ? liters / dist * 100 : null;
+  const st = statusOf(cons, data.settings);
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      liters: () => parseNumber(f.liters, {
+        min: 0.01
+      }),
+      cost: () => parseNumber(f.cost, {
+        min: 0
+      }),
+      mileage: () => parseNumber(f.mileage, {
+        integer: true,
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    setData(upsertEntry(data, "tankowania", entry, {
+      date: v.date,
+      fuelType: f.fuelType,
+      liters: v.liters,
+      cost: v.cost,
+      pricePerL: +(v.cost / v.liters).toFixed(3),
+      mileage: v.mileage,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano tankowanie z ${dateFmt(v.date)}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "tankowania", entry));
+    notify(`Usunięto tankowanie z ${dateFmt(entry.date)}`, "warn");
+    onClose();
+  };
+  return (
+    <EntrySheet
+      title={entry ? "Edycja tankowania" : "Nowe tankowanie"}
+      entry={entry}
+      deleteLabel={entry ? `tankowanie z ${dateFmt(entry.date)}` : ""}
+      onClose={onClose}
+      onSave={save}
+      onDelete={remove}
+    >
+      <FormField label="Data" error={errors.date}>
+        <DateInput value={f.date} onChange={set("date")} error={errors.date} />
+      </FormField>
+      <FormField label="Paliwo">
+        <Segmented options={fuels} value={f.fuelType} onChange={set("fuelType")} />
+      </FormField>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 10
+        }}
+      >
+        <FormField label="Litry" hint="np. 52,4" error={errors.liters}>
+          <TextInput
+            value={f.liters}
+            onChange={set("liters")}
+            suffix="l"
+            inputMode="decimal"
+            error={errors.liters}
+          />
+        </FormField>
+        <FormField label="Kwota" hint="np. 412,80" error={errors.cost}>
+          <TextInput
+            value={f.cost}
+            onChange={set("cost")}
+            suffix="zł"
+            inputMode="decimal"
+            error={errors.cost}
+          />
+        </FormField>
+      </div>
+      <FormField
+        label="Przebieg"
+        hint={hintPrev ? `poprzednio ${num(hintPrev.mileage, 0)} km` : ""}
+        error={errors.mileage}
+      >
+        <TextInput
+          value={f.mileage}
+          onChange={set("mileage")}
+          suffix="km"
+          inputMode="numeric"
+          error={errors.mileage}
+        />
+      </FormField>
+      <FormField label="Notatka" hint="opcjonalnie">
+        <TextInput value={f.note} onChange={set("note")} />
+      </FormField>
+      <SummaryBox
+        items={[["Cena za litr", liters && cost ? `${num(cost / liters, 2)} zł` : "—"], ["Dystans", dist !== null ? `${num(dist, 0)} km` : "—", dist !== null && dist <= 0 ? C.red : null], ["Spalanie", cons ? `${num(cons, 2)} l/100` : "—", st?.color]]}
+      />
+    </EntrySheet>
   );
 }
 
 /* ---------- TAB: SERWISY ---------- */
 function SerwisyTab({
   data,
-  setData
+  setData,
+  notify
 }) {
-  const [open, setOpen] = useState(false);
   const {
     serwisy
   } = data;
-  const sorted = [...serwisy].sort((a, b) => a.date < b.date ? 1 : -1);
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      mileage: "",
-      description: "",
-      price: "",
-      warranty: false
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    if (!form.description || !form.date) return;
-    const price = parseFloat(form.price) || 0;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      mileage: parseInt(form.mileage, 10) || null,
-      description: form.description,
-      price,
-      warranty: form.warranty,
-      paidCost: form.warranty ? 0 : price,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      serwisy: [...serwisy, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    serwisy: serwisy.filter(s => s.id !== id)
-  });
+  const [editing, setEditing] = useState(null);
+  const byDate = (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12
-        }}
-      >
-        <div
-          style={{
-            color: C.textDim,
-            fontSize: 12
-          }}
-        >
-          {sorted.length}
-          {" wpisów serwisowych"}
-        </div>
-        <button onClick={startNew} style={addBtnStyle}>
-          <Icon.plus />
-          Dodaj
-        </button>
-      </div>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8
-        }}
-      >
-        {sorted.map(s => (
-          <Card
-            key={s.id}
-            style={{
-              padding: 12
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "flex-start"
+      <ListHeader
+        text={serwisy.length ? `${plural(serwisy.length, "wpis", "wpisy", "wpisów")} · płatne ${pln(sumBy(serwisy, "paidCost"))}` : ""}
+        onAdd={() => setEditing({
+          entry: null
+        })}
+      />
+      {serwisy.length === 0 ? <EmptyList text="Brak wpisów serwisowych." /> : (
+        <MonthGroups
+          entries={serwisy}
+          compare={byDate}
+          groupSummary={g => pln(sumBy(g, "paidCost"))}
+          renderRow={s => (
+            <EntryRow
+              key={s.id}
+              date={s.date}
+              title={s.description}
+              sub={[s.mileage ? `${num(s.mileage, 0)} km` : null, s.note || null].filter(Boolean).join(" · ") || "—"}
+              amount={pln(s.price)}
+              badge={s.warranty ? {
+                text: "Gwarancja",
+                color: C.green
+              } : {
+                text: "Płatny",
+                color: C.textDim
               }}
-            >
-              <div>
-                <div
-                  style={{
-                    color: C.text,
-                    fontWeight: 600,
-                    fontSize: 14
-                  }}
-                >
-                  {s.description}
-                </div>
-                <div
-                  style={{
-                    color: C.textDim,
-                    fontSize: 12
-                  }}
-                >
-                  {dateFmt(s.date)}
-                  {s.mileage ? ` · ${num(s.mileage, 0)} km` : ""}
-                </div>
-                {s.note && (
-                  <div
-                    style={{
-                      color: C.textFaint,
-                      fontSize: 11,
-                      marginTop: 3
-                    }}
-                  >
-                    {s.note}
-                  </div>
-                )}
-              </div>
-              <div
-                style={{
-                  textAlign: "right"
-                }}
-              >
-                <div
-                  style={{
-                    color: C.text,
-                    fontFamily: "'JetBrains Mono', monospace",
-                    fontWeight: 600
-                  }}
-                >
-                  {pln(s.price)}
-                </div>
-              </div>
-            </div>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                marginTop: 8
-              }}
-            >
-              <Pill
-                text={s.warranty ? "Gwarancja" : "Płatny"}
-                color={s.warranty ? C.green : C.amber}
-              />
-              {!s.id.startsWith("seed") && (
-                <button onClick={() => remove(s.id)} style={trashBtn}>
-                  <Icon.trash />
-                </button>
-              )}
-            </div>
-          </Card>
-        ))}
-      </div>
-      {open && (
-        <SheetModal title="Nowy wpis serwisowy" onClose={() => setOpen(false)}>
-          <Field label="Data">
-            <input
-              type="date"
-              style={inputStyle}
-              value={form.date}
-              onChange={e => setForm({
-                ...form,
-                date: e.target.value
+              onOpen={() => setEditing({
+                entry: s
               })}
             />
-          </Field>
-          <Field label="Przebieg (km)">
-            <input
-              type="number"
-              inputMode="numeric"
-              style={inputStyle}
-              value={form.mileage}
-              onChange={e => setForm({
-                ...form,
-                mileage: e.target.value
-              })}
-            />
-          </Field>
-          <Field label="Co było wykonane">
-            <input
-              type="text"
-              style={inputStyle}
-              value={form.description}
-              onChange={e => setForm({
-                ...form,
-                description: e.target.value
-              })}
-              placeholder="np. Olej + filtr"
-            />
-          </Field>
-          <Field label="Cena (zł)">
-            <input
-              type="number"
-              inputMode="decimal"
-              style={inputStyle}
-              value={form.price}
-              onChange={e => setForm({
-                ...form,
-                price: e.target.value
-              })}
-            />
-          </Field>
-          <Field label="Naprawa gwarancyjna?">
-            <div
-              style={{
-                display: "flex",
-                gap: 8
-              }}
-            >
-              <button
-                onClick={() => setForm({
-                  ...form,
-                  warranty: true
-                })}
-                style={toggleBtn(form.warranty)}
-              >
-                Tak
-              </button>
-              <button
-                onClick={() => setForm({
-                  ...form,
-                  warranty: false
-                })}
-                style={toggleBtn(!form.warranty)}
-              >
-                Nie
-              </button>
-            </div>
-          </Field>
-          <Field label="Notatka (opcjonalnie)">
-            <input
-              type="text"
-              style={inputStyle}
-              value={form.note || ""}
-              onChange={e => setForm({
-                ...form,
-                note: e.target.value
-              })}
-            />
-          </Field>
-          <PrimaryButton onClick={save} disabled={!form.description}>
-            Zapisz serwis
-          </PrimaryButton>
-        </SheetModal>
+          )}
+        />
+      )}
+      {editing && (
+        <SerwisSheet
+          data={data}
+          setData={setData}
+          notify={notify}
+          entry={editing.entry}
+          onClose={() => setEditing(null)}
+        />
       )}
     </div>
+  );
+}
+function SerwisSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    description: entry.description,
+    mileage: entry.mileage ? String(entry.mileage) : "",
+    price: numIn(entry.price),
+    warranty: !!entry.warranty,
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    description: "",
+    mileage: "",
+    price: "",
+    warranty: false,
+    note: ""
+  });
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      description: () => {
+        if (!f.description.trim()) throw new Error("Opisz, co zostało zrobione");
+        return f.description.trim();
+      },
+      mileage: () => parseNumber(f.mileage, {
+        integer: true,
+        optional: true,
+        min: 0
+      }),
+      price: () => parseNumber(f.price, {
+        optional: true,
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    const price = v.price || 0;
+    setData(upsertEntry(data, "serwisy", entry, {
+      date: v.date,
+      mileage: v.mileage,
+      description: v.description,
+      price,
+      warranty: f.warranty,
+      paidCost: f.warranty ? 0 : price,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano serwis z ${dateFmt(v.date)}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "serwisy", entry));
+    notify(`Usunięto wpis „${entry.description}”`, "warn");
+    onClose();
+  };
+  return (
+    <EntrySheet
+      title={entry ? "Edycja wpisu serwisowego" : "Nowy wpis serwisowy"}
+      entry={entry}
+      deleteLabel={entry ? `wpis „${entry.description}”` : ""}
+      onClose={onClose}
+      onSave={save}
+      onDelete={remove}
+    >
+      <FormField label="Data" error={errors.date}>
+        <DateInput value={f.date} onChange={set("date")} error={errors.date} />
+      </FormField>
+      <FormField label="Co zostało wykonane" hint="np. wymiana oleju" error={errors.description}>
+        <TextInput value={f.description} onChange={set("description")} error={errors.description} />
+      </FormField>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 10
+        }}
+      >
+        <FormField label="Przebieg" hint="opcjonalnie" error={errors.mileage}>
+          <TextInput
+            value={f.mileage}
+            onChange={set("mileage")}
+            suffix="km"
+            inputMode="numeric"
+            error={errors.mileage}
+          />
+        </FormField>
+        <FormField label="Cena" error={errors.price}>
+          <TextInput
+            value={f.price}
+            onChange={set("price")}
+            suffix="zł"
+            inputMode="decimal"
+            error={errors.price}
+          />
+        </FormField>
+      </div>
+      <SwitchRow
+        label="Naprawa gwarancyjna"
+        sub="nie wlicza się do kosztów"
+        checked={f.warranty}
+        onChange={set("warranty")}
+      />
+      <FormField label="Notatka" hint="opcjonalnie, np. nazwa serwisu">
+        <TextInput value={f.note} onChange={set("note")} />
+      </FormField>
+    </EntrySheet>
   );
 }
 
 /* ---------- TAB: KOSZTY ---------- */
 function KosztyTab({
   data,
-  setData
+  setData,
+  notify
 }) {
-  const [open, setOpen] = useState(false);
   const {
     koszty
   } = data;
-  const sorted = [...koszty].sort((a, b) => a.date < b.date ? 1 : -1);
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      type: "Inne",
-      description: "",
-      amount: "",
-      oneTime: true
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    const amount = parseFloat(form.amount);
-    if (!amount || !form.date) return;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      type: form.type,
-      description: form.description || form.type,
-      amount,
-      oneTime: form.oneTime,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      koszty: [...koszty, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    koszty: koszty.filter(k => k.id !== id)
-  });
+  const [editing, setEditing] = useState(null);
+  const byDate = (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+  const running = sumBy(koszty.filter(k => k.type !== "Zakup auta"), "amount");
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12
-        }}
-      >
-        <div
-          style={{
-            color: C.textDim,
-            fontSize: 12
-          }}
-        >
-          {sorted.length}
-          {" pozycji kosztowych"}
-        </div>
-        <button onClick={startNew} style={addBtnStyle}>
-          <Icon.plus />
-          Dodaj
-        </button>
-      </div>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8
-        }}
-      >
-        {sorted.map(k => (
-          <Card
-            key={k.id}
-            style={{
-              padding: 12
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "flex-start"
+      <ListHeader
+        text={koszty.length ? `${plural(koszty.length, "pozycja", "pozycje", "pozycji")} · bez zakupu auta ${pln(running)}` : ""}
+        onAdd={() => setEditing({
+          entry: null
+        })}
+      />
+      {koszty.length === 0 ? <EmptyList text="Brak kosztów." /> : (
+        <MonthGroups
+          entries={koszty}
+          compare={byDate}
+          groupSummary={g => pln(sumBy(g, "amount"))}
+          renderRow={k => (
+            <EntryRow
+              key={k.id}
+              date={k.date}
+              title={k.description}
+              sub={k.type + (k.note ? ` · ${k.note}` : "")}
+              amount={pln(k.amount)}
+              badge={{
+                text: k.type,
+                color: k.type === "Zakup auta" ? C.copper : C.textDim
               }}
-            >
-              <div>
-                <div
-                  style={{
-                    color: C.text,
-                    fontWeight: 600,
-                    fontSize: 14
-                  }}
-                >
-                  {k.description}
-                </div>
-                <div
-                  style={{
-                    color: C.textDim,
-                    fontSize: 12
-                  }}
-                >
-                  {dateFmt(k.date)}
-                </div>
-              </div>
-              <div
-                style={{
-                  textAlign: "right"
-                }}
-              >
-                <div
-                  style={{
-                    color: C.text,
-                    fontFamily: "'JetBrains Mono', monospace",
-                    fontWeight: 600
-                  }}
-                >
-                  {pln(k.amount)}
-                </div>
-              </div>
-            </div>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                marginTop: 8
-              }}
-            >
-              <Pill text={k.type} color={C.copper} />
-              {!k.id.startsWith("seed") && (
-                <button onClick={() => remove(k.id)} style={trashBtn}>
-                  <Icon.trash />
-                </button>
-              )}
-            </div>
-          </Card>
-        ))}
-      </div>
-      {open && (
-        <SheetModal title="Nowy koszt" onClose={() => setOpen(false)}>
-          <Field label="Data">
-            <input
-              type="date"
-              style={inputStyle}
-              value={form.date}
-              onChange={e => setForm({
-                ...form,
-                date: e.target.value
+              onOpen={() => setEditing({
+                entry: k
               })}
             />
-          </Field>
-          <Field label="Typ kosztu">
-            <select
-              style={inputStyle}
-              value={form.type}
-              onChange={e => setForm({
-                ...form,
-                type: e.target.value
-              })}
-            >
-              {KOSZTY_TYPES.map(t => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Opis">
-            <input
-              type="text"
-              style={inputStyle}
-              value={form.description}
-              onChange={e => setForm({
-                ...form,
-                description: e.target.value
-              })}
-            />
-          </Field>
-          <Field label="Kwota (zł)">
-            <input
-              type="number"
-              inputMode="decimal"
-              style={inputStyle}
-              value={form.amount}
-              onChange={e => setForm({
-                ...form,
-                amount: e.target.value
-              })}
-            />
-          </Field>
-          <PrimaryButton onClick={save} disabled={!form.amount}>
-            Zapisz koszt
-          </PrimaryButton>
-        </SheetModal>
+          )}
+        />
       )}
+      {editing && (
+        <KosztSheet
+          data={data}
+          setData={setData}
+          notify={notify}
+          entry={editing.entry}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </div>
+  );
+}
+function KosztSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    type: entry.type,
+    description: entry.description,
+    amount: numIn(entry.amount),
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    type: "Inne",
+    description: "",
+    amount: "",
+    note: ""
+  });
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const types = KOSZTY_TYPES.includes(f.type) ? KOSZTY_TYPES : [...KOSZTY_TYPES, f.type];
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      amount: () => parseNumber(f.amount, {
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    const description = f.description.trim() || f.type;
+    setData(upsertEntry(data, "koszty", entry, {
+      date: v.date,
+      type: f.type,
+      description,
+      amount: v.amount,
+      // new costs count towards monthly totals; an edited entry keeps its flag
+      oneTime: entry ? entry.oneTime ?? true : true,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano koszt: ${description}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "koszty", entry));
+    notify(`Usunięto koszt „${entry.description}”`, "warn");
+    onClose();
+  };
+  return (
+    <EntrySheet
+      title={entry ? "Edycja kosztu" : "Nowy koszt"}
+      entry={entry}
+      deleteLabel={entry ? `koszt „${entry.description}”` : ""}
+      onClose={onClose}
+      onSave={save}
+      onDelete={remove}
+    >
+      <FormField label="Data" error={errors.date}>
+        <DateInput value={f.date} onChange={set("date")} error={errors.date} />
+      </FormField>
+      <FormField label="Kategoria">
+        <select
+          style={{
+            ...inputStyle,
+            colorScheme: "dark"
+          }}
+          value={f.type}
+          onChange={e => set("type")(e.target.value)}
+        >
+          {types.map(t => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+      </FormField>
+      <FormField label="Opis" hint="np. polisa OC/AC">
+        <TextInput value={f.description} onChange={set("description")} />
+      </FormField>
+      <FormField label="Kwota" error={errors.amount}>
+        <TextInput
+          value={f.amount}
+          onChange={set("amount")}
+          suffix="zł"
+          inputMode="decimal"
+          error={errors.amount}
+        />
+      </FormField>
+      <FormField label="Notatka" hint="opcjonalnie">
+        <TextInput value={f.note} onChange={set("note")} />
+      </FormField>
+    </EntrySheet>
+  );
+}
+
+/* ---------- TOAST ---------- */
+function Toast({
+  toast
+}) {
+  if (!toast) return null;
+  const color = toast.kind === "warn" ? C.amber : toast.kind === "error" ? C.red : C.green;
+  return (
+    <div
+      style={{
+        position: "fixed",
+        left: "50%",
+        transform: "translateX(-50%)",
+        bottom: "calc(env(safe-area-inset-bottom, 0px) + 84px)",
+        zIndex: 60,
+        background: C.surface2,
+        border: `1px solid ${C.line}`,
+        borderRadius: 12,
+        padding: "10px 14px",
+        display: "flex",
+        gap: 9,
+        alignItems: "center",
+        fontSize: 13,
+        color: C.text,
+        boxShadow: "0 8px 24px #00000088",
+        maxWidth: "calc(100% - 32px)",
+        width: "max-content"
+      }}
+    >
+      <span
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: 99,
+          background: color,
+          flex: "none"
+        }}
+      />
+      {toast.text}
     </div>
   );
 }
@@ -2067,167 +2719,194 @@ function PrognozaTab({
 }
 
 /* ---------- TAB: USTAWIENIA ---------- */
+const settingsToForm = s => ({
+  carName: s.carName,
+  carSubtitle: s.carSubtitle,
+  consumptionOkTo: numIn(s.consumptionOkTo),
+  consumptionHighFrom: numIn(s.consumptionHighFrom),
+  fuelPriceGrowth: numIn(+(s.fuelPriceGrowth * 100).toFixed(4)),
+  monthlyKmPlan: numIn(s.monthlyKmPlan),
+  carPrice: numIn(s.carPrice)
+});
+function SectionTitle({
+  children
+}) {
+  return (
+    <div
+      style={{
+        fontSize: 13,
+        fontWeight: 600,
+        color: C.text,
+        margin: "4px 0 12px"
+      }}
+    >
+      {children}
+    </div>
+  );
+}
 function UstawieniaTab({
   data,
-  setData
+  setData,
+  notify
 }) {
-  const [local, setLocal] = useState(data.settings);
-  const dirty = JSON.stringify(local) !== JSON.stringify(data.settings);
-  const save = () => setData({
-    ...data,
-    settings: local
-  });
+  const [f, setF] = useState(() => settingsToForm(data.settings));
+  const [errors, setErrors] = useState({});
+  const [pendingImport, setPendingImport] = useState(null);
   const fileInputRef = React.useRef(null);
-  const [status, setStatus] = useState(null); // { type: 'ok'|'error', text }
-
+  const dirty = JSON.stringify(f) !== JSON.stringify(settingsToForm(data.settings));
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const save = () => {
+    const r = validate({
+      consumptionOkTo: () => parseNumber(f.consumptionOkTo, {
+        min: 0.1
+      }),
+      consumptionHighFrom: () => parseNumber(f.consumptionHighFrom, {
+        min: 0.1
+      }),
+      fuelPriceGrowth: () => parseNumber(f.fuelPriceGrowth),
+      monthlyKmPlan: () => parseNumber(f.monthlyKmPlan, {
+        min: 0
+      }),
+      carPrice: () => parseNumber(f.carPrice, {
+        min: 0
+      })
+    });
+    if (r.ok && r.values.consumptionHighFrom <= r.values.consumptionOkTo) {
+      r.errors.consumptionHighFrom = "Musi być większe niż próg „w normie”";
+      r.ok = false;
+    }
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    setData({
+      ...data,
+      settings: {
+        ...data.settings,
+        carName: f.carName.trim() || "MOJE AUTO",
+        carSubtitle: f.carSubtitle.trim() || "DZIENNIK POKŁADOWY",
+        consumptionOkTo: v.consumptionOkTo,
+        consumptionHighFrom: v.consumptionHighFrom,
+        fuelPriceGrowth: v.fuelPriceGrowth / 100,
+        monthlyKmPlan: v.monthlyKmPlan,
+        carPrice: v.carPrice
+      }
+    });
+    notify("Ustawienia zapisane");
+  };
   const handleExport = async () => {
-    setStatus(null);
     const res = await exportBackup(data);
     if (res.ok && res.method !== "cancelled") {
-      setStatus({
-        type: "ok",
-        text: res.method === "share" ? "Gotowe — wybierz Dysk Google w oknie udostępniania." : "Plik pobrany. Możesz go teraz przenieść na Dysk Google."
-      });
+      notify(res.method === "share" ? "Wybierz Dysk Google w oknie udostępniania" : "Plik kopii pobrany");
     }
   };
-  const handleImportClick = () => fileInputRef.current && fileInputRef.current.click();
   const handleFileChange = async e => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     try {
-      const imported = await readBackupFile(file);
-      setData(imported);
-      setStatus({
-        type: "ok",
-        text: "Dane wczytane z kopii zapasowej."
+      setPendingImport({
+        name: file.name,
+        data: await readBackupFile(file)
       });
     } catch (err) {
-      setStatus({
-        type: "error",
-        text: err.message
-      });
+      notify(err.message, "error");
     }
   };
+  const applyImport = () => {
+    setData(pendingImport.data);
+    setF(settingsToForm(pendingImport.data.settings));
+    notify(`Wczytano ${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}`);
+    setPendingImport(null);
+  };
+  const field = (key, label, suffix, inputMode = "decimal") => (
+    <FormField label={label} error={errors[key]}>
+      <TextInput
+        value={f[key]}
+        onChange={set(key)}
+        suffix={suffix}
+        inputMode={inputMode}
+        error={errors[key]}
+      />
+    </FormField>
+  );
   return (
     <div
       style={{
         display: "flex",
         flexDirection: "column",
-        gap: 4
+        gap: 10
       }}
     >
       <Card>
-        <Field label="Nazwa auta (nagłówek)">
-          <input
-            type="text"
-            style={inputStyle}
-            value={local.carName}
-            onChange={e => setLocal({
-              ...local,
-              carName: e.target.value
-            })}
-            placeholder="np. CUPRA TERRAMAR"
-          />
-        </Field>
-        <Field label="Podtytuł nagłówka">
-          <input
-            type="text"
-            style={inputStyle}
-            value={local.carSubtitle}
-            onChange={e => setLocal({
-              ...local,
-              carSubtitle: e.target.value
-            })}
-            placeholder="np. DZIENNIK POKŁADOWY"
-          />
-        </Field>
-        <Field label="Próg spalania — OK do (l/100km)">
-          <input
-            type="number"
-            step="0.1"
-            style={inputStyle}
-            value={local.consumptionOkTo}
-            onChange={e => setLocal({
-              ...local,
-              consumptionOkTo: +e.target.value
-            })}
-          />
-        </Field>
-        <Field label="Próg spalania — wysokie od (l/100km)">
-          <input
-            type="number"
-            step="0.1"
-            style={inputStyle}
-            value={local.consumptionHighFrom}
-            onChange={e => setLocal({
-              ...local,
-              consumptionHighFrom: +e.target.value
-            })}
-          />
-        </Field>
-        <Field label="Wzrost cen paliwa (rocznie, np. 0.05 = 5%)">
-          <input
-            type="number"
-            step="0.01"
-            style={inputStyle}
-            value={local.fuelPriceGrowth}
-            onChange={e => setLocal({
-              ...local,
-              fuelPriceGrowth: +e.target.value
-            })}
-          />
-        </Field>
-        <Field label="Przebieg miesięczny do symulacji (km)">
-          <input
-            type="number"
-            style={inputStyle}
-            value={local.monthlyKmPlan}
-            onChange={e => setLocal({
-              ...local,
-              monthlyKmPlan: +e.target.value
-            })}
-          />
-        </Field>
-        <Field label="Cena auta / baza amortyzacji (zł)">
-          <input
-            type="number"
-            style={inputStyle}
-            value={local.carPrice}
-            onChange={e => setLocal({
-              ...local,
-              carPrice: +e.target.value
-            })}
-          />
-        </Field>
-        <PrimaryButton onClick={save} disabled={!dirty}>
-          Zapisz ustawienia
-        </PrimaryButton>
+        <SectionTitle>Pojazd</SectionTitle>
+        {field("carName", "Nazwa auta", null, "text")}
+        {field("carSubtitle", "Podtytuł", null, "text")}
+        {field("carPrice", "Cena auta", "zł")}
       </Card>
-      <Card
-        style={{
-          marginTop: 10
-        }}
-      >
+      <Card>
+        <SectionTitle>Progi spalania</SectionTitle>
         <div
           style={{
-            fontSize: 13,
-            fontWeight: 600,
-            color: C.text,
-            marginBottom: 4
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 10
           }}
         >
-          Kopia zapasowa
+          {field("consumptionOkTo", "W normie do", "l/100")}
+          {field("consumptionHighFrom", "Wysokie od", "l/100")}
         </div>
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap"
+          }}
+        >
+          <Pill text="W normie" color={C.green} />
+          <Pill text="Podwyższone" color={C.amber} />
+          <Pill text="Wysokie" color={C.red} />
+        </div>
+      </Card>
+      <Card>
+        <SectionTitle>Prognoza</SectionTitle>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 10
+          }}
+        >
+          {field("monthlyKmPlan", "Przebieg miesięczny", "km", "numeric")}
+          {field("fuelPriceGrowth", "Wzrost cen paliwa", "%/rok")}
+        </div>
+      </Card>
+      <PrimaryButton onClick={save} disabled={!dirty}>
+        Zapisz ustawienia
+      </PrimaryButton>
+      <Card
+        style={{
+          marginTop: 6
+        }}
+      >
+        <SectionTitle>Kopia zapasowa</SectionTitle>
         <div
           style={{
             fontSize: 11.5,
             color: C.textFaint,
+            marginTop: -6,
             marginBottom: 12,
             lineHeight: 1.5
           }}
         >
-          Zapisz wszystkie dane do pliku i przenieś go np. na Dysk Google, albo wczytaj wcześniej zapisaną kopię.
+          Zapisz wszystkie dane do pliku (np. na Dysk Google) albo wczytaj wcześniej zapisaną kopię. Plik jest zgodny z wersją desktopową.
         </div>
         <div
           style={{
@@ -2246,7 +2925,7 @@ function UstawieniaTab({
             Eksportuj dane
           </button>
           <button
-            onClick={handleImportClick}
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
             style={{
               ...toggleBtn(false),
               flex: 1
@@ -2264,28 +2943,27 @@ function UstawieniaTab({
           }}
           onChange={handleFileChange}
         />
-        {status && (
-          <div
-            style={{
-              marginTop: 10,
-              fontSize: 12,
-              color: status.type === "error" ? C.red : C.green
-            }}
-          >
-            {status.text}
-          </div>
-        )}
       </Card>
       <div
         style={{
           fontSize: 11.5,
           color: C.textFaint,
-          padding: "10px 4px",
+          padding: "4px 4px 10px",
           lineHeight: 1.5
         }}
       >
         Dane są zapisywane bezpośrednio w pamięci tej przeglądarki na Twoim telefonie (localStorage) — zostają nawet po zamknięciu aplikacji. Kopia zapasowa to jedyny sposób, by przenieść je na inne urządzenie.
       </div>
+      {pendingImport && (
+        <ConfirmSheet
+          title="Wczytać kopię?"
+          message={`Obecne dane zostaną zastąpione zawartością pliku ${pendingImport.name} (${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}, ${plural(pendingImport.data.serwisy.length, "serwis", "serwisy", "serwisów")}, ${plural(pendingImport.data.koszty.length, "koszt", "koszty", "kosztów")}).`}
+          confirmText="Wczytaj"
+          danger={false}
+          onCancel={() => setPendingImport(null)}
+          onConfirm={applyImport}
+        />
+      )}
     </div>
   );
 }
@@ -2326,6 +3004,17 @@ function CarDashboardApp() {
     error
   } = useCarData();
   const [tab, setTab] = useState("dashboard");
+  const [toast, setToast] = useState(null);
+  const notify = useCallback((text, kind = "ok") => setToast({
+    text,
+    kind,
+    at: Date.now()
+  }), []);
+  useEffect(() => {
+    if (!toast) return undefined;
+    const t = setTimeout(() => setToast(null), 2600);
+    return () => clearTimeout(t);
+  }, [toast]);
   const agg = useAggregates(data || EMPTY_DATA);
   // data is null on the first render (loaded in useEffect)
   const settings = (data || EMPTY_DATA).settings;
@@ -2365,20 +3054,15 @@ function CarDashboardApp() {
               gap: 10
             }}
           >
-            <div
+            <img
+              src="emblem.png"
+              alt=""
               style={{
-                width: 38,
-                height: 38,
-                borderRadius: 10,
-                background: C.copper + "22",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                border: `1px solid ${C.copperDim}`
+                height: 30,
+                width: "auto",
+                display: "block"
               }}
-            >
-              <Icon.car size={19} color={C.copper} />
-            </div>
+            />
             <div>
               <div
                 style={{
@@ -2435,15 +3119,16 @@ function CarDashboardApp() {
           )}
           {!loading && data && (
             <>
-              {tab === "dashboard" && <Dashboard agg={agg} settings={data.settings} />}
-              {tab === "tankowania" && <TankowaniaTab data={data} setData={setData} />}
-              {tab === "serwisy" && <SerwisyTab data={data} setData={setData} />}
-              {tab === "koszty" && <KosztyTab data={data} setData={setData} />}
+              {tab === "dashboard" && <Dashboard agg={agg} settings={data.settings} tankowania={data.tankowania} />}
+              {tab === "tankowania" && <TankowaniaTab data={data} setData={setData} notify={notify} />}
+              {tab === "serwisy" && <SerwisyTab data={data} setData={setData} notify={notify} />}
+              {tab === "koszty" && <KosztyTab data={data} setData={setData} notify={notify} />}
               {tab === "prognoza" && <PrognozaTab agg={agg} settings={data.settings} />}
-              {tab === "ustawienia" && <UstawieniaTab data={data} setData={setData} />}
+              {tab === "ustawienia" && <UstawieniaTab data={data} setData={setData} notify={notify} />}
             </>
           )}
         </main>
+        <Toast toast={toast} />
         <nav
           style={{
             position: "fixed",

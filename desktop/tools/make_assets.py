@@ -1,12 +1,15 @@
-﻿"""Builds desktop/assets/ from the source logo (copper on white).
+﻿"""Builds the app graphics from the source logo (copper on white or transparent).
 
-    py tools/make_assets.py <logo.png>
+    py desktop/tools/make_assets.py <logo.png>
 
-Outputs:
-    assets/emblem.png     emblem only, transparent background, app copper colour
-    assets/wordmark.png   "CUPRA" lettering, transparent background
-    assets/app.ico        window / taskbar icon (emblem on a dark rounded tile)
-    assets/app_icon.png   the same icon as PNG (window icon outside Windows)
+Outputs (desktop):
+    desktop/assets/emblem.png     emblem only, transparent background, app copper colour
+    desktop/assets/wordmark.png   "CUPRA" lettering, transparent background
+    desktop/assets/app.ico        window / taskbar icon (emblem on a dark rounded tile)
+    desktop/assets/app_icon.png   the same icon as PNG (window icon outside Windows)
+Outputs (web app, repo root):
+    icon-192.png, icon-512.png    PWA / home-screen icons (maskable: full-bleed background)
+    emblem.png                    emblem for the app header
 """
 import sys
 from pathlib import Path
@@ -15,8 +18,10 @@ from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent.parent
 ASSETS = HERE / "assets"
+REPO = HERE.parent
 COPPER = (201, 106, 52)  # C["copper"]
 TILE = (26, 22, 19)      # C["surface"]
+BG = (15, 13, 12)        # C["bg"], also the PWA theme colour
 
 
 def recolor(img):
@@ -71,7 +76,21 @@ def main(src):
     tile.alpha_composite(e, ((size - e.width) // 2, (size - e.height) // 2 + 6))
     tile.save(ASSETS / "app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     tile.save(ASSETS / "app_icon.png")
+    pwa_assets(emblem)
     print("emblem", emblem.size, "wordmark", word.size)
+
+
+def pwa_assets(emblem):
+    # launchers mask the icon (circle, squircle...): the emblem stays inside the central safe zone
+    for size in (192, 512):
+        icon = Image.new("RGBA", (size, size), BG + (255,))
+        e = emblem.copy()
+        e.thumbnail((int(size * 0.58), int(size * 0.58)), Image.LANCZOS)
+        icon.alpha_composite(e, ((size - e.width) // 2, (size - e.height) // 2 + size // 40))
+        icon.convert("RGB").save(REPO / f"icon-{size}.png", optimize=True)
+    header = emblem.copy()
+    header.thumbnail((10_000, 96), Image.LANCZOS)  # shown 30 px high, sharp up to 3x displays
+    header.save(REPO / "emblem.png", optimize=True)
 
 
 if __name__ == "__main__":

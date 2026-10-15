@@ -587,7 +587,6 @@ const SEED_SERWISY = [{
   warranty: false,
   paidCost: 250,
   note: ""
-
 }, {
   id: "seed-s-2",
   date: "2026-08-11",
@@ -641,7 +640,7 @@ const SEED_SETTINGS = {
   carSubtitle: "DZIENNIK POKŁADOWY"
 };
 const KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"];
-const FUEL_TYPES = ["Pb95", "Pb98", "E10", "Inne"];
+const FUEL_TYPES = ["Pb95", "Pb98"];
 
 /* ---------- HELPERS ---------- */
 const pln = n => (n ?? 0).toLocaleString("pl-PL", {
@@ -774,7 +773,11 @@ function useCarData() {
     }
   }, []);
   const setData = useCallback(next => {
-    const clean = sanitize(next);
+    const sane = sanitize(next);
+    const clean = {
+      ...sane,
+      tankowania: recalcTankowania(sane.tankowania)
+    };
     setDataState(clean);
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
@@ -873,7 +876,9 @@ function KPI({
   icon: Ico,
   label,
   value,
-  accent
+  accent,
+  sub,
+  valueColor
 }) {
   return /*#__PURE__*/React.createElement(Card, {
     style: {
@@ -900,9 +905,15 @@ function KPI({
       fontFamily: "'JetBrains Mono', monospace",
       fontSize: 21,
       fontWeight: 600,
-      color: C.text
+      color: valueColor || C.text
     }
-  }, value));
+  }, value), sub && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.textFaint,
+      marginTop: -2
+    }
+  }, sub));
 }
 function Pill({
   text,
@@ -1219,7 +1230,7 @@ function ConsumptionGauge({
     circ = 2 * Math.PI * r;
   const status = statusOf(value, settings);
   const color = status ? status.color : C.textFaint;
-  return /*#__PURE__*/React.createElement("div", {
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       position: "relative",
       width: 140,
@@ -1274,14 +1285,17 @@ function ConsumptionGauge({
       fontSize: 10.5,
       color: C.textDim
     }
-  }, "l / 100km"), status && /*#__PURE__*/React.createElement("div", {
+  }, "l / 100km"))), status &&
+  /*#__PURE__*/
+  // below the ring: the longer labels ("Podwyższone") would overlap the arc inside it
+  React.createElement("div", {
     style: {
-      marginTop: 4
+      marginTop: 8
     }
   }, /*#__PURE__*/React.createElement(Pill, {
-    text: status.label,
+    text: STATUS_TEXT[status.label],
     color: status.color
-  }))));
+  })));
 }
 
 /* ---------- AGGREGATION ---------- */
@@ -1384,9 +1398,13 @@ function useAggregates(data) {
 /* ---------- TAB: DASHBOARD ---------- */
 function Dashboard({
   agg,
-  settings
+  settings,
+  tankowania
 }) {
   const chartData = agg.monthly.filter(m => m.total > 0);
+  const lastFill = [...tankowania].sort(byDateMileage).pop();
+  const fuelPerKm = agg.totalDistance ? agg.totalFuelCost / agg.totalDistance : null;
+  const ls = agg.lastService;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -1419,28 +1437,35 @@ function Dashboard({
   }, /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.money,
     label: "Koszt całkowity",
-    value: pln(agg.totalCost)
+    value: pln(agg.totalCost),
+    sub: `paliwo ${pln(agg.totalFuelCost)}`
   }), /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.gauge,
     label: "Dystans",
-    value: `${num(agg.totalDistance, 0)} km`
+    value: `${num(agg.totalDistance, 0)} km`,
+    sub: plural(tankowania.length, "tankowanie", "tankowania", "tankowań")
   }), /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.trend,
     label: "Koszt / km",
-    value: agg.costPerKm ? `${num(agg.costPerKm, 2)} zł` : "—"
+    value: agg.costPerKm ? `${num(agg.costPerKm, 2)} zł` : "—",
+    sub: fuelPerKm ? `samo paliwo ${num(fuelPerKm, 2)} zł` : null
   }), /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.drop,
     label: "Śr. cena / l",
-    value: agg.avgPricePerL ? `${num(agg.avgPricePerL, 2)} zł` : "—"
+    value: agg.avgPricePerL ? `${num(agg.avgPricePerL, 2)} zł` : "—",
+    sub: lastFill ? `ostatnio ${num(lastFill.pricePerL, 2)} zł` : null
   }), /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.alert,
     label: "Alerty spalania",
     value: agg.alerts,
-    accent: agg.alerts ? C.red : C.green
+    accent: agg.alerts ? C.red : C.green,
+    valueColor: agg.alerts ? C.red : null,
+    sub: `≥ ${num(settings.consumptionHighFrom, 1)} l/100km`
   }), /*#__PURE__*/React.createElement(KPI, {
     icon: Icon.shield,
     label: "Ostatni serwis",
-    value: agg.lastService ? dateFmt(agg.lastService.date) : "—"
+    value: ls ? dateFmt(ls.date) : "—",
+    sub: ls ? [ls.mileage ? `${num(ls.mileage, 0)} km` : null, ls.warranty ? "gwarancja" : pln(ls.price)].filter(Boolean).join(" · ") : null
   })), chartData.length > 0 && /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12.5,
@@ -1485,566 +1510,1170 @@ function Dashboard({
   })));
 }
 
-/* ---------- TAB: TANKOWANIA ---------- */
-function TankowaniaTab({
-  data,
-  setData
-}) {
-  const [open, setOpen] = useState(false);
-  const {
-    tankowania,
-    settings
-  } = data;
-  const sorted = [...tankowania].sort((a, b) => a.date < b.date ? 1 : -1);
-  const lastMileage = sorted[0]?.mileage || "";
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      fuelType: "Pb98",
-      liters: "",
-      cost: "",
-      mileage: ""
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    const liters = parseFloat(form.liters),
-      cost = parseFloat(form.cost),
-      mileage = parseInt(form.mileage, 10);
-    if (!liters || !cost || !mileage || !form.date) return;
-    const prev = sorted[0];
-    const distance = prev && prev.mileage ? mileage - prev.mileage : null;
-    const consumption = distance && distance > 0 ? +(liters / distance * 100).toFixed(2) : null;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      fuelType: form.fuelType,
-      liters,
-      cost,
-      pricePerL: +(cost / liters).toFixed(3),
-      mileage,
-      distance,
-      consumption,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      tankowania: [...tankowania, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    tankowania: tankowania.filter(t => t.id !== id)
-  });
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.textDim,
-      fontSize: 12
-    }
-  }, sorted.length, " tankowań · ostatni przebieg ", num(lastMileage, 0), " km"), /*#__PURE__*/React.createElement("button", {
-    onClick: startNew,
-    style: addBtnStyle
-  }, /*#__PURE__*/React.createElement(Icon.plus, null), "Dodaj")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 8
-    }
-  }, sorted.map(t => {
-    const status = statusOf(t.consumption, settings);
-    return /*#__PURE__*/React.createElement(Card, {
-      key: t.id,
-      style: {
-        padding: 12
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "flex-start"
-      }
-    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: C.text,
-        fontWeight: 600,
-        fontSize: 14
-      }
-    }, t.fuelType, " · ", num(t.liters, 2), " l"), /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: C.textDim,
-        fontSize: 12
-      }
-    }, dateFmt(t.date), " · ", num(t.mileage, 0), " km", t.distance ? ` (+${num(t.distance, 0)} km)` : "")), /*#__PURE__*/React.createElement("div", {
-      style: {
-        textAlign: "right"
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: C.text,
-        fontFamily: "'JetBrains Mono', monospace",
-        fontWeight: 600
-      }
-    }, pln(t.cost)), /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: C.textFaint,
-        fontSize: 11
-      }
-    }, num(t.pricePerL, 2), " zł/l"))), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        marginTop: 8
-      }
-    }, status ? /*#__PURE__*/React.createElement(Pill, {
-      text: `${num(t.consumption, 2)} l/100km · ${status.label}`,
-      color: status.color
-    }) : /*#__PURE__*/React.createElement("span", null), !t.id.startsWith("seed") && /*#__PURE__*/React.createElement("button", {
-      onClick: () => remove(t.id),
-      style: trashBtn
-    }, /*#__PURE__*/React.createElement(Icon.trash, null))));
-  })), open && /*#__PURE__*/React.createElement(SheetModal, {
-    title: "Nowe tankowanie",
-    onClose: () => setOpen(false)
-  }, /*#__PURE__*/React.createElement(Field, {
-    label: "Data"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    style: inputStyle,
-    value: form.date,
-    onChange: e => setForm({
-      ...form,
-      date: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Paliwo"
-  }, /*#__PURE__*/React.createElement("select", {
-    style: inputStyle,
-    value: form.fuelType,
-    onChange: e => setForm({
-      ...form,
-      fuelType: e.target.value
-    })
-  }, FUEL_TYPES.map(f => /*#__PURE__*/React.createElement("option", {
-    key: f,
-    value: f
-  }, f)))), /*#__PURE__*/React.createElement(Field, {
-    label: "Litry"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    inputMode: "decimal",
-    style: inputStyle,
-    value: form.liters,
-    onChange: e => setForm({
-      ...form,
-      liters: e.target.value
-    }),
-    placeholder: "np. 52.30"
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Koszt (zł)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    inputMode: "decimal",
-    style: inputStyle,
-    value: form.cost,
-    onChange: e => setForm({
-      ...form,
-      cost: e.target.value
-    }),
-    placeholder: "np. 410.50"
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Przebieg (km)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    inputMode: "numeric",
-    style: inputStyle,
-    value: form.mileage,
-    onChange: e => setForm({
-      ...form,
-      mileage: e.target.value
-    }),
-    placeholder: `ostatni: ${lastMileage}`
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Notatka (opcjonalnie)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: form.note || "",
-    onChange: e => setForm({
-      ...form,
-      note: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(PrimaryButton, {
-    onClick: save,
-    disabled: !form.liters || !form.cost || !form.mileage
-  }, "Zapisz tankowanie")));
-}
+/* ---------- FORM HELPERS ---------- */
+const MONTHS_FULL = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"];
+const MONTHS_SHORT = ["sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz", "paź", "lis", "gru"];
+const STATUS_TEXT = {
+  OK: "W normie",
+  Uwaga: "Podwyższone",
+  Wysokie: "Wysokie"
+};
+const plural = (n, one, few, many) => {
+  if (n === 1) return `${n} ${one}`;
+  const few_ = n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14);
+  return `${n} ${few_ ? few : many}`;
+};
+const localIso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const todayIso = (daysAgo = 0) => {
+  const d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  return localIso(d);
+};
+const numIn = v => v === null || v === undefined ? "" : String(v).replace(".", ",");
 
-/* ---------- TAB: SERWISY ---------- */
-function SerwisyTab({
-  data,
-  setData
-}) {
-  const [open, setOpen] = useState(false);
-  const {
-    serwisy
-  } = data;
-  const sorted = [...serwisy].sort((a, b) => a.date < b.date ? 1 : -1);
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      mileage: "",
-      description: "",
-      price: "",
-      warranty: false
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    if (!form.description || !form.date) return;
-    const price = parseFloat(form.price) || 0;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      mileage: parseInt(form.mileage, 10) || null,
-      description: form.description,
-      price,
-      warranty: form.warranty,
-      paidCost: form.warranty ? 0 : price,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      serwisy: [...serwisy, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    serwisy: serwisy.filter(s => s.id !== id)
+// "1 234,5" -> 1234.5; throws an Error with a message shown under the field
+function parseNumber(raw, {
+  integer = false,
+  optional = false,
+  min = null
+} = {}) {
+  const s = String(raw ?? "").replace(/[\s ]/g, "").replace(",", ".");
+  if (!s) {
+    if (optional) return null;
+    throw new Error("To pole jest wymagane");
+  }
+  if (!(integer ? /^-?\d+$/ : /^-?\d+(\.\d+)?$/).test(s)) {
+    throw new Error(integer ? "Wpisz liczbę całkowitą" : "Wpisz liczbę, np. 52,4");
+  }
+  const v = integer ? parseInt(s, 10) : parseFloat(s);
+  if (min !== null && v < min) throw new Error(`Wartość musi być ≥ ${num(min, 0)}`);
+  return v;
+}
+const tryNumber = (raw, opts) => {
+  try {
+    return parseNumber(raw, opts);
+  } catch (e) {
+    return null;
+  }
+};
+
+// runs every rule, collecting values and per-field error messages
+function validate(rules) {
+  const values = {},
+    errors = {};
+  Object.entries(rules).forEach(([key, fn]) => {
+    try {
+      values[key] = fn();
+    } catch (e) {
+      errors[key] = e.message;
+    }
   });
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  return {
+    values,
+    errors,
+    ok: Object.keys(errors).length === 0
+  };
+}
+const byDateMileage = (a, b) => a.date === b.date ? a.mileage - b.mileage : a.date < b.date ? -1 : 1;
+
+// distance and consumption follow from the mileage difference to the previous fill-up (as in the xlsx)
+function recalcTankowania(list) {
+  const order = list.map((t, i) => [t, i]).sort((a, b) => byDateMileage(a[0], b[0]));
+  const out = list.slice();
+  let prev = null;
+  order.forEach(([t, i]) => {
+    const distance = prev ? t.mileage - prev.mileage : null;
+    const consumption = distance && distance > 0 ? +(t.liters / distance * 100).toFixed(2) : null;
+    out[i] = t.distance === distance && t.consumption === consumption ? t : {
+      ...t,
+      distance,
+      consumption
+    };
+    prev = t;
+  });
+  return out;
+}
+const upsertEntry = (data, coll, entry, values) => ({
+  ...data,
+  [coll]: entry ? data[coll].map(x => x.id === entry.id ? {
+    ...x,
+    ...values
+  } : x) : [...data[coll], {
+    id: uid(),
+    ...values
+  }]
+});
+const removeEntry = (data, coll, entry) => ({
+  ...data,
+  [coll]: data[coll].filter(x => x.id !== entry.id)
+});
+
+/* ---------- FORM PRIMITIVES ---------- */
+function FormField({
+  label,
+  hint,
+  error,
+  children
+}) {
+  return /*#__PURE__*/React.createElement("div", {
     style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
       marginBottom: 12
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
-      color: C.textDim,
-      fontSize: 12
-    }
-  }, sorted.length, " wpisów serwisowych"), /*#__PURE__*/React.createElement("button", {
-    onClick: startNew,
-    style: addBtnStyle
-  }, /*#__PURE__*/React.createElement(Icon.plus, null), "Dodaj")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 8
-    }
-  }, sorted.map(s => /*#__PURE__*/React.createElement(Card, {
-    key: s.id,
-    style: {
-      padding: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
       display: "flex",
       justifyContent: "space-between",
-      alignItems: "flex-start"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.text,
-      fontWeight: 600,
-      fontSize: 14
-    }
-  }, s.description), /*#__PURE__*/React.createElement("div", {
-    style: {
+      fontSize: 12,
       color: C.textDim,
-      fontSize: 12
+      marginBottom: 5
     }
-  }, dateFmt(s.date), s.mileage ? ` · ${num(s.mileage, 0)} km` : ""), s.note && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", null, label), hint && /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.textFaint,
-      fontSize: 11,
-      marginTop: 3
+      fontSize: 11
     }
-  }, s.note)), /*#__PURE__*/React.createElement("div", {
+  }, hint)), children, error && /*#__PURE__*/React.createElement("div", {
     style: {
-      textAlign: "right"
+      color: C.red,
+      fontSize: 11.5,
+      marginTop: 4
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, error));
+}
+function TextInput({
+  value,
+  onChange,
+  suffix,
+  error,
+  inputMode = "text",
+  placeholder
+}) {
+  return /*#__PURE__*/React.createElement("div", {
     style: {
-      color: C.text,
-      fontFamily: "'JetBrains Mono', monospace",
-      fontWeight: 600
+      position: "relative"
     }
-  }, pln(s.price)))), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    inputMode: inputMode,
+    value: value,
+    placeholder: placeholder,
+    onChange: e => onChange(e.target.value),
     style: {
+      ...inputStyle,
+      border: `1px solid ${error ? C.red : C.line}`,
+      paddingRight: suffix ? 44 : 12
+    }
+  }), suffix && /*#__PURE__*/React.createElement("span", {
+    style: {
+      position: "absolute",
+      right: 12,
+      top: "50%",
+      transform: "translateY(-50%)",
+      color: C.textFaint,
+      fontSize: 12,
+      pointerEvents: "none"
+    }
+  }, suffix));
+}
+function DateInput({
+  value,
+  onChange,
+  error
+}) {
+  const chip = (text, daysAgo) => {
+    const iso = todayIso(daysAgo);
+    return /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => onChange(iso),
+      style: {
+        ...toggleBtn(value === iso),
+        flex: "none",
+        padding: "9px 12px"
+      }
+    }, text);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: value,
+    onChange: e => onChange(e.target.value),
+    style: {
+      ...inputStyle,
+      flex: 1,
+      minWidth: 0,
+      border: `1px solid ${error ? C.red : C.line}`,
+      colorScheme: "dark"
+    }
+  }), chip("Dziś", 0), chip("Wczoraj", 1));
+}
+function Segmented({
+  options,
+  value,
+  onChange
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, options.map(o => /*#__PURE__*/React.createElement("button", {
+    key: o,
+    type: "button",
+    onClick: () => onChange(o),
+    style: toggleBtn(o === value)
+  }, o)));
+}
+function SwitchRow({
+  label,
+  sub,
+  checked,
+  onChange
+}) {
+  return /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: () => onChange(!checked),
+    style: {
+      width: "100%",
       display: "flex",
       justifyContent: "space-between",
       alignItems: "center",
-      marginTop: 8
+      background: C.bg,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: "10px 12px",
+      marginBottom: 12,
+      cursor: "pointer",
+      textAlign: "left"
     }
-  }, /*#__PURE__*/React.createElement(Pill, {
-    text: s.warranty ? "Gwarancja" : "Płatny",
-    color: s.warranty ? C.green : C.amber
-  }), !s.id.startsWith("seed") && /*#__PURE__*/React.createElement("button", {
-    onClick: () => remove(s.id),
-    style: trashBtn
-  }, /*#__PURE__*/React.createElement(Icon.trash, null)))))), open && /*#__PURE__*/React.createElement(SheetModal, {
-    title: "Nowy wpis serwisowy",
-    onClose: () => setOpen(false)
-  }, /*#__PURE__*/React.createElement(Field, {
-    label: "Data"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    style: inputStyle,
-    value: form.date,
-    onChange: e => setForm({
-      ...form,
-      date: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Przebieg (km)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    inputMode: "numeric",
-    style: inputStyle,
-    value: form.mileage,
-    onChange: e => setForm({
-      ...form,
-      mileage: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Co było wykonane"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: form.description,
-    onChange: e => setForm({
-      ...form,
-      description: e.target.value
-    }),
-    placeholder: "np. Olej + filtr"
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Cena (zł)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    inputMode: "decimal",
-    style: inputStyle,
-    value: form.price,
-    onChange: e => setForm({
-      ...form,
-      price: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Naprawa gwarancyjna?"
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "block",
+      color: C.text,
+      fontSize: 13.5,
+      fontWeight: 600
+    }
+  }, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "block",
+      color: C.textFaint,
+      fontSize: 11
+    }
+  }, sub)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 42,
+      height: 24,
+      borderRadius: 99,
+      background: checked ? C.copper : C.line,
+      position: "relative",
+      transition: "background .2s",
+      flex: "none"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      position: "absolute",
+      top: 3,
+      left: checked ? 21 : 3,
+      width: 18,
+      height: 18,
+      borderRadius: 99,
+      background: C.text,
+      transition: "left .2s"
+    }
+  })));
+}
+function SummaryBox({
+  items
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `repeat(${items.length}, 1fr)`,
+      background: C.bg,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: "10px 12px",
+      marginBottom: 8
+    }
+  }, items.map(([label, value, color]) => /*#__PURE__*/React.createElement("div", {
+    key: label
   }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: C.textFaint
+    }
+  }, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Space Grotesk', sans-serif",
+      fontWeight: 700,
+      fontSize: 15,
+      color: color || C.text,
+      marginTop: 2
+    }
+  }, value))));
+}
+function ConfirmSheet({
+  title,
+  message,
+  confirmText,
+  danger = true,
+  onConfirm,
+  onCancel
+}) {
+  return /*#__PURE__*/React.createElement(SheetModal, {
+    title: title,
+    onClose: onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.textDim,
+      fontSize: 13.5,
+      lineHeight: 1.5,
+      marginBottom: 16
+    }
+  }, message), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8
     }
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setForm({
-      ...form,
-      warranty: true
-    }),
-    style: toggleBtn(form.warranty)
-  }, "Tak"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setForm({
-      ...form,
-      warranty: false
-    }),
-    style: toggleBtn(!form.warranty)
-  }, "Nie"))), /*#__PURE__*/React.createElement(Field, {
-    label: "Notatka (opcjonalnie)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: form.note || "",
-    onChange: e => setForm({
-      ...form,
-      note: e.target.value
+    type: "button",
+    onClick: onCancel,
+    style: {
+      ...toggleBtn(false),
+      padding: 12,
+      color: C.text
+    }
+  }, "Anuluj"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: onConfirm,
+    style: {
+      ...toggleBtn(false),
+      padding: 12,
+      background: danger ? C.red : C.copper,
+      border: "none",
+      color: danger ? "#FFFFFF" : "#100C09"
+    }
+  }, confirmText)));
+}
+
+// add/edit sheet with Anuluj / Zapisz and, when editing, Usuń behind a confirmation
+function EntrySheet({
+  title,
+  entry,
+  deleteLabel,
+  onClose,
+  onSave,
+  onDelete,
+  children
+}) {
+  const [confirming, setConfirming] = useState(false);
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(SheetModal, {
+    title: title,
+    onClose: onClose
+  }, children, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 8,
+      alignItems: "center"
+    }
+  }, entry && /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: () => setConfirming(true),
+    style: {
+      background: "none",
+      border: "none",
+      color: C.red,
+      display: "flex",
+      alignItems: "center",
+      gap: 5,
+      fontSize: 13.5,
+      padding: "10px 4px",
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement(Icon.trash, null), "Usuń"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: onClose,
+    style: {
+      ...toggleBtn(false),
+      flex: "none",
+      padding: "12px 16px",
+      color: C.text
+    }
+  }, "Anuluj"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: onSave,
+    style: {
+      ...addBtnStyle,
+      padding: "12px 18px",
+      fontSize: 14
+    }
+  }, entry ? "Zapisz zmiany" : "Zapisz"))), confirming && /*#__PURE__*/React.createElement(ConfirmSheet, {
+    title: "Usunąć wpis?",
+    message: `Czy na pewno usunąć ${deleteLabel}? Tej operacji nie można cofnąć.`,
+    confirmText: "Usuń",
+    onCancel: () => setConfirming(false),
+    onConfirm: onDelete
+  }));
+}
+
+/* ---------- LISTS ---------- */
+function ListHeader({
+  text,
+  onAdd
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 4,
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.textDim,
+      fontSize: 12
+    }
+  }, text), /*#__PURE__*/React.createElement("button", {
+    onClick: onAdd,
+    style: addBtnStyle
+  }, /*#__PURE__*/React.createElement(Icon.plus, null), "Dodaj"));
+}
+function EmptyList({
+  text
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      color: C.textFaint,
+      fontSize: 13,
+      padding: "48px 0"
+    }
+  }, text);
+}
+
+// newest first, grouped by month with a per-month summary
+function MonthGroups({
+  entries,
+  compare,
+  groupSummary,
+  renderRow
+}) {
+  const sorted = [...entries].sort((a, b) => -compare(a, b));
+  const groups = [];
+  sorted.forEach(e => {
+    const k = monthKey(e.date);
+    if (!groups.length || groups[groups.length - 1].key !== k) groups.push({
+      key: k,
+      items: []
+    });
+    groups[groups.length - 1].items.push(e);
+  });
+  return groups.map(g => {
+    const [y, m] = g.key.split("-");
+    return /*#__PURE__*/React.createElement("div", {
+      key: g.key
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "baseline",
+        padding: "14px 2px 7px"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textDim,
+        fontSize: 12.5,
+        fontWeight: 600
+      }
+    }, MONTHS_FULL[+m - 1], " ", y), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.textFaint,
+        fontSize: 11.5
+      }
+    }, groupSummary(g.items))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 8
+      }
+    }, g.items.map(renderRow)));
+  });
+}
+function EntryRow({
+  date,
+  title,
+  sub,
+  amount,
+  badge,
+  onOpen
+}) {
+  const [, m, d] = date.split("-").map(Number);
+  return /*#__PURE__*/React.createElement(Card, {
+    onClick: onOpen,
+    style: {
+      padding: 10,
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 46,
+      height: 46,
+      borderRadius: 10,
+      background: C.surface2,
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      flex: "none"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Space Grotesk', sans-serif",
+      fontWeight: 700,
+      fontSize: 17,
+      lineHeight: 1,
+      color: C.text
+    }
+  }, d), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9.5,
+      color: C.textFaint,
+      marginTop: 3
+    }
+  }, MONTHS_SHORT[m - 1])), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.text,
+      fontWeight: 600,
+      fontSize: 14,
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis"
+    }
+  }, title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.textDim,
+      fontSize: 12,
+      marginTop: 2,
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis"
+    }
+  }, sub)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right",
+      flex: "none"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'JetBrains Mono', monospace",
+      fontWeight: 600,
+      color: C.text,
+      fontSize: 13.5
+    }
+  }, amount), badge && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 4
+    }
+  }, /*#__PURE__*/React.createElement(Pill, {
+    text: badge.text,
+    color: badge.color
+  }))));
+}
+const sumBy = (list, key) => list.reduce((s, x) => s + (x[key] || 0), 0);
+
+/* ---------- TAB: TANKOWANIA ---------- */
+function TankowaniaTab({
+  data,
+  setData,
+  notify
+}) {
+  const {
+    tankowania,
+    settings
+  } = data;
+  const [editing, setEditing] = useState(null);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(ListHeader, {
+    text: tankowania.length ? `${plural(tankowania.length, "tankowanie", "tankowania", "tankowań")} · ${pln(sumBy(tankowania, "cost"))}` : "",
+    onAdd: () => setEditing({
+      entry: null
     })
-  })), /*#__PURE__*/React.createElement(PrimaryButton, {
-    onClick: save,
-    disabled: !form.description
-  }, "Zapisz serwis")));
+  }), tankowania.length === 0 ? /*#__PURE__*/React.createElement(EmptyList, {
+    text: "Brak tankowań — dodaj pierwsze."
+  }) : /*#__PURE__*/React.createElement(MonthGroups, {
+    entries: tankowania,
+    compare: byDateMileage,
+    groupSummary: g => `${num(sumBy(g, "liters"), 1)} l · ${pln(sumBy(g, "cost"))}`,
+    renderRow: t => {
+      const st = statusOf(t.consumption, settings);
+      return /*#__PURE__*/React.createElement(EntryRow, {
+        key: t.id,
+        date: t.date,
+        title: `${t.fuelType} · ${num(t.liters, 2)} l`,
+        sub: `${num(t.mileage, 0)} km${t.distance ? ` (+${num(t.distance, 0)} km)` : ""} · ${num(t.pricePerL, 2)} zł/l${t.note ? ` · ${t.note}` : ""}`,
+        amount: pln(t.cost),
+        badge: st && {
+          text: `${num(t.consumption, 2)} l/100`,
+          color: st.color
+        },
+        onOpen: () => setEditing({
+          entry: t
+        })
+      });
+    }
+  }), editing && /*#__PURE__*/React.createElement(TankowanieSheet, {
+    data: data,
+    setData: setData,
+    notify: notify,
+    entry: editing.entry,
+    onClose: () => setEditing(null)
+  }));
+}
+function TankowanieSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const latest = [...data.tankowania].sort(byDateMileage).pop();
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    fuelType: entry.fuelType,
+    liters: numIn(entry.liters),
+    cost: numIn(entry.cost),
+    mileage: String(entry.mileage),
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    fuelType: latest?.fuelType || "Pb98",
+    liters: "",
+    cost: "",
+    mileage: "",
+    note: ""
+  });
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  // an older entry may use a fuel type that is no longer offered; keep it selectable for that entry
+  const fuels = FUEL_TYPES.includes(f.fuelType) ? FUEL_TYPES : [...FUEL_TYPES, f.fuelType];
+
+  // live preview of price per litre, distance and consumption
+  const others = data.tankowania.filter(t => !entry || t.id !== entry.id);
+  const previousOf = (date, mileage) => others.filter(t => byDateMileage(t, {
+    date,
+    mileage
+  }) < 0).sort(byDateMileage).pop();
+  const liters = tryNumber(f.liters),
+    cost = tryNumber(f.cost),
+    mileage = tryNumber(f.mileage, {
+      integer: true
+    });
+  const prev = f.date && mileage !== null ? previousOf(f.date, mileage) : null;
+  const hintPrev = prev || (entry ? previousOf(entry.date, entry.mileage) : latest);
+  const dist = prev && mileage !== null ? mileage - prev.mileage : null;
+  const cons = liters && dist > 0 ? liters / dist * 100 : null;
+  const st = statusOf(cons, data.settings);
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      liters: () => parseNumber(f.liters, {
+        min: 0.01
+      }),
+      cost: () => parseNumber(f.cost, {
+        min: 0
+      }),
+      mileage: () => parseNumber(f.mileage, {
+        integer: true,
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    setData(upsertEntry(data, "tankowania", entry, {
+      date: v.date,
+      fuelType: f.fuelType,
+      liters: v.liters,
+      cost: v.cost,
+      pricePerL: +(v.cost / v.liters).toFixed(3),
+      mileage: v.mileage,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano tankowanie z ${dateFmt(v.date)}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "tankowania", entry));
+    notify(`Usunięto tankowanie z ${dateFmt(entry.date)}`, "warn");
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(EntrySheet, {
+    title: entry ? "Edycja tankowania" : "Nowe tankowanie",
+    entry: entry,
+    deleteLabel: entry ? `tankowanie z ${dateFmt(entry.date)}` : "",
+    onClose: onClose,
+    onSave: save,
+    onDelete: remove
+  }, /*#__PURE__*/React.createElement(FormField, {
+    label: "Data",
+    error: errors.date
+  }, /*#__PURE__*/React.createElement(DateInput, {
+    value: f.date,
+    onChange: set("date"),
+    error: errors.date
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Paliwo"
+  }, /*#__PURE__*/React.createElement(Segmented, {
+    options: fuels,
+    value: f.fuelType,
+    onChange: set("fuelType")
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement(FormField, {
+    label: "Litry",
+    hint: "np. 52,4",
+    error: errors.liters
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.liters,
+    onChange: set("liters"),
+    suffix: "l",
+    inputMode: "decimal",
+    error: errors.liters
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Kwota",
+    hint: "np. 412,80",
+    error: errors.cost
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.cost,
+    onChange: set("cost"),
+    suffix: "zł",
+    inputMode: "decimal",
+    error: errors.cost
+  }))), /*#__PURE__*/React.createElement(FormField, {
+    label: "Przebieg",
+    hint: hintPrev ? `poprzednio ${num(hintPrev.mileage, 0)} km` : "",
+    error: errors.mileage
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.mileage,
+    onChange: set("mileage"),
+    suffix: "km",
+    inputMode: "numeric",
+    error: errors.mileage
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Notatka",
+    hint: "opcjonalnie"
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.note,
+    onChange: set("note")
+  })), /*#__PURE__*/React.createElement(SummaryBox, {
+    items: [["Cena za litr", liters && cost ? `${num(cost / liters, 2)} zł` : "—"], ["Dystans", dist !== null ? `${num(dist, 0)} km` : "—", dist !== null && dist <= 0 ? C.red : null], ["Spalanie", cons ? `${num(cons, 2)} l/100` : "—", st?.color]]
+  }));
+}
+
+/* ---------- TAB: SERWISY ---------- */
+function SerwisyTab({
+  data,
+  setData,
+  notify
+}) {
+  const {
+    serwisy
+  } = data;
+  const [editing, setEditing] = useState(null);
+  const byDate = (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(ListHeader, {
+    text: serwisy.length ? `${plural(serwisy.length, "wpis", "wpisy", "wpisów")} · płatne ${pln(sumBy(serwisy, "paidCost"))}` : "",
+    onAdd: () => setEditing({
+      entry: null
+    })
+  }), serwisy.length === 0 ? /*#__PURE__*/React.createElement(EmptyList, {
+    text: "Brak wpisów serwisowych."
+  }) : /*#__PURE__*/React.createElement(MonthGroups, {
+    entries: serwisy,
+    compare: byDate,
+    groupSummary: g => pln(sumBy(g, "paidCost")),
+    renderRow: s => /*#__PURE__*/React.createElement(EntryRow, {
+      key: s.id,
+      date: s.date,
+      title: s.description,
+      sub: [s.mileage ? `${num(s.mileage, 0)} km` : null, s.note || null].filter(Boolean).join(" · ") || "—",
+      amount: pln(s.price),
+      badge: s.warranty ? {
+        text: "Gwarancja",
+        color: C.green
+      } : {
+        text: "Płatny",
+        color: C.textDim
+      },
+      onOpen: () => setEditing({
+        entry: s
+      })
+    })
+  }), editing && /*#__PURE__*/React.createElement(SerwisSheet, {
+    data: data,
+    setData: setData,
+    notify: notify,
+    entry: editing.entry,
+    onClose: () => setEditing(null)
+  }));
+}
+function SerwisSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    description: entry.description,
+    mileage: entry.mileage ? String(entry.mileage) : "",
+    price: numIn(entry.price),
+    warranty: !!entry.warranty,
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    description: "",
+    mileage: "",
+    price: "",
+    warranty: false,
+    note: ""
+  });
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      description: () => {
+        if (!f.description.trim()) throw new Error("Opisz, co zostało zrobione");
+        return f.description.trim();
+      },
+      mileage: () => parseNumber(f.mileage, {
+        integer: true,
+        optional: true,
+        min: 0
+      }),
+      price: () => parseNumber(f.price, {
+        optional: true,
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    const price = v.price || 0;
+    setData(upsertEntry(data, "serwisy", entry, {
+      date: v.date,
+      mileage: v.mileage,
+      description: v.description,
+      price,
+      warranty: f.warranty,
+      paidCost: f.warranty ? 0 : price,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano serwis z ${dateFmt(v.date)}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "serwisy", entry));
+    notify(`Usunięto wpis „${entry.description}”`, "warn");
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(EntrySheet, {
+    title: entry ? "Edycja wpisu serwisowego" : "Nowy wpis serwisowy",
+    entry: entry,
+    deleteLabel: entry ? `wpis „${entry.description}”` : "",
+    onClose: onClose,
+    onSave: save,
+    onDelete: remove
+  }, /*#__PURE__*/React.createElement(FormField, {
+    label: "Data",
+    error: errors.date
+  }, /*#__PURE__*/React.createElement(DateInput, {
+    value: f.date,
+    onChange: set("date"),
+    error: errors.date
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Co zostało wykonane",
+    hint: "np. wymiana oleju",
+    error: errors.description
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.description,
+    onChange: set("description"),
+    error: errors.description
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement(FormField, {
+    label: "Przebieg",
+    hint: "opcjonalnie",
+    error: errors.mileage
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.mileage,
+    onChange: set("mileage"),
+    suffix: "km",
+    inputMode: "numeric",
+    error: errors.mileage
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Cena",
+    error: errors.price
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.price,
+    onChange: set("price"),
+    suffix: "zł",
+    inputMode: "decimal",
+    error: errors.price
+  }))), /*#__PURE__*/React.createElement(SwitchRow, {
+    label: "Naprawa gwarancyjna",
+    sub: "nie wlicza się do kosztów",
+    checked: f.warranty,
+    onChange: set("warranty")
+  }), /*#__PURE__*/React.createElement(FormField, {
+    label: "Notatka",
+    hint: "opcjonalnie, np. nazwa serwisu"
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.note,
+    onChange: set("note")
+  })));
 }
 
 /* ---------- TAB: KOSZTY ---------- */
 function KosztyTab({
   data,
-  setData
+  setData,
+  notify
 }) {
-  const [open, setOpen] = useState(false);
   const {
     koszty
   } = data;
-  const sorted = [...koszty].sort((a, b) => a.date < b.date ? 1 : -1);
-  const [form, setForm] = useState(null);
-  const startNew = () => {
-    setForm({
-      date: new Date().toISOString().slice(0, 10),
-      type: "Inne",
-      description: "",
-      amount: "",
-      oneTime: true
-    });
-    setOpen(true);
-  };
-  const save = () => {
-    const amount = parseFloat(form.amount);
-    if (!amount || !form.date) return;
-    const entry = {
-      id: uid(),
-      date: form.date,
-      type: form.type,
-      description: form.description || form.type,
-      amount,
-      oneTime: form.oneTime,
-      note: form.note || ""
-    };
-    setData({
-      ...data,
-      koszty: [...koszty, entry]
-    });
-    setOpen(false);
-  };
-  const remove = id => setData({
-    ...data,
-    koszty: koszty.filter(k => k.id !== id)
+  const [editing, setEditing] = useState(null);
+  const byDate = (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+  const running = sumBy(koszty.filter(k => k.type !== "Zakup auta"), "amount");
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(ListHeader, {
+    text: koszty.length ? `${plural(koszty.length, "pozycja", "pozycje", "pozycji")} · bez zakupu auta ${pln(running)}` : "",
+    onAdd: () => setEditing({
+      entry: null
+    })
+  }), koszty.length === 0 ? /*#__PURE__*/React.createElement(EmptyList, {
+    text: "Brak kosztów."
+  }) : /*#__PURE__*/React.createElement(MonthGroups, {
+    entries: koszty,
+    compare: byDate,
+    groupSummary: g => pln(sumBy(g, "amount")),
+    renderRow: k => /*#__PURE__*/React.createElement(EntryRow, {
+      key: k.id,
+      date: k.date,
+      title: k.description,
+      sub: k.type + (k.note ? ` · ${k.note}` : ""),
+      amount: pln(k.amount),
+      badge: {
+        text: k.type,
+        color: k.type === "Zakup auta" ? C.copper : C.textDim
+      },
+      onOpen: () => setEditing({
+        entry: k
+      })
+    })
+  }), editing && /*#__PURE__*/React.createElement(KosztSheet, {
+    data: data,
+    setData: setData,
+    notify: notify,
+    entry: editing.entry,
+    onClose: () => setEditing(null)
+  }));
+}
+function KosztSheet({
+  data,
+  setData,
+  notify,
+  entry,
+  onClose
+}) {
+  const [f, setF] = useState(() => entry ? {
+    date: entry.date,
+    type: entry.type,
+    description: entry.description,
+    amount: numIn(entry.amount),
+    note: entry.note || ""
+  } : {
+    date: todayIso(),
+    type: "Inne",
+    description: "",
+    amount: "",
+    note: ""
   });
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.textDim,
-      fontSize: 12
-    }
-  }, sorted.length, " pozycji kosztowych"), /*#__PURE__*/React.createElement("button", {
-    onClick: startNew,
-    style: addBtnStyle
-  }, /*#__PURE__*/React.createElement(Icon.plus, null), "Dodaj")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 8
-    }
-  }, sorted.map(k => /*#__PURE__*/React.createElement(Card, {
-    key: k.id,
-    style: {
-      padding: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "flex-start"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.text,
-      fontWeight: 600,
-      fontSize: 14
-    }
-  }, k.description), /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.textDim,
-      fontSize: 12
-    }
-  }, dateFmt(k.date))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "right"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.text,
-      fontFamily: "'JetBrains Mono', monospace",
-      fontWeight: 600
-    }
-  }, pln(k.amount)))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginTop: 8
-    }
-  }, /*#__PURE__*/React.createElement(Pill, {
-    text: k.type,
-    color: C.copper
-  }), !k.id.startsWith("seed") && /*#__PURE__*/React.createElement("button", {
-    onClick: () => remove(k.id),
-    style: trashBtn
-  }, /*#__PURE__*/React.createElement(Icon.trash, null)))))), open && /*#__PURE__*/React.createElement(SheetModal, {
-    title: "Nowy koszt",
-    onClose: () => setOpen(false)
-  }, /*#__PURE__*/React.createElement(Field, {
-    label: "Data"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    style: inputStyle,
-    value: form.date,
-    onChange: e => setForm({
-      ...form,
-      date: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Typ kosztu"
+  const [errors, setErrors] = useState({});
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const types = KOSZTY_TYPES.includes(f.type) ? KOSZTY_TYPES : [...KOSZTY_TYPES, f.type];
+  const save = () => {
+    const r = validate({
+      date: () => {
+        if (!f.date) throw new Error("Wybierz datę");
+        return f.date;
+      },
+      amount: () => parseNumber(f.amount, {
+        min: 0
+      })
+    });
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    const description = f.description.trim() || f.type;
+    setData(upsertEntry(data, "koszty", entry, {
+      date: v.date,
+      type: f.type,
+      description,
+      amount: v.amount,
+      // new costs count towards monthly totals; an edited entry keeps its flag
+      oneTime: entry ? entry.oneTime ?? true : true,
+      note: f.note.trim()
+    }));
+    notify(`Zapisano koszt: ${description}`);
+    onClose();
+  };
+  const remove = () => {
+    setData(removeEntry(data, "koszty", entry));
+    notify(`Usunięto koszt „${entry.description}”`, "warn");
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(EntrySheet, {
+    title: entry ? "Edycja kosztu" : "Nowy koszt",
+    entry: entry,
+    deleteLabel: entry ? `koszt „${entry.description}”` : "",
+    onClose: onClose,
+    onSave: save,
+    onDelete: remove
+  }, /*#__PURE__*/React.createElement(FormField, {
+    label: "Data",
+    error: errors.date
+  }, /*#__PURE__*/React.createElement(DateInput, {
+    value: f.date,
+    onChange: set("date"),
+    error: errors.date
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Kategoria"
   }, /*#__PURE__*/React.createElement("select", {
-    style: inputStyle,
-    value: form.type,
-    onChange: e => setForm({
-      ...form,
-      type: e.target.value
-    })
-  }, KOSZTY_TYPES.map(t => /*#__PURE__*/React.createElement("option", {
+    style: {
+      ...inputStyle,
+      colorScheme: "dark"
+    },
+    value: f.type,
+    onChange: e => set("type")(e.target.value)
+  }, types.map(t => /*#__PURE__*/React.createElement("option", {
     key: t,
     value: t
-  }, t)))), /*#__PURE__*/React.createElement(Field, {
-    label: "Opis"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: form.description,
-    onChange: e => setForm({
-      ...form,
-      description: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Kwota (zł)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
+  }, t)))), /*#__PURE__*/React.createElement(FormField, {
+    label: "Opis",
+    hint: "np. polisa OC/AC"
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.description,
+    onChange: set("description")
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Kwota",
+    error: errors.amount
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.amount,
+    onChange: set("amount"),
+    suffix: "zł",
     inputMode: "decimal",
-    style: inputStyle,
-    value: form.amount,
-    onChange: e => setForm({
-      ...form,
-      amount: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(PrimaryButton, {
-    onClick: save,
-    disabled: !form.amount
-  }, "Zapisz koszt")));
+    error: errors.amount
+  })), /*#__PURE__*/React.createElement(FormField, {
+    label: "Notatka",
+    hint: "opcjonalnie"
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f.note,
+    onChange: set("note")
+  })));
+}
+
+/* ---------- TOAST ---------- */
+function Toast({
+  toast
+}) {
+  if (!toast) return null;
+  const color = toast.kind === "warn" ? C.amber : toast.kind === "error" ? C.red : C.green;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      left: "50%",
+      transform: "translateX(-50%)",
+      bottom: "calc(env(safe-area-inset-bottom, 0px) + 84px)",
+      zIndex: 60,
+      background: C.surface2,
+      border: `1px solid ${C.line}`,
+      borderRadius: 12,
+      padding: "10px 14px",
+      display: "flex",
+      gap: 9,
+      alignItems: "center",
+      fontSize: 13,
+      color: C.text,
+      boxShadow: "0 8px 24px #00000088",
+      maxWidth: "calc(100% - 32px)",
+      width: "max-content"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 8,
+      height: 8,
+      borderRadius: 99,
+      background: color,
+      flex: "none"
+    }
+  }), toast.text);
 }
 
 /* ---------- TAB: PROGNOZA ---------- */
@@ -2123,151 +2752,168 @@ function PrognozaTab({
 }
 
 /* ---------- TAB: USTAWIENIA ---------- */
+const settingsToForm = s => ({
+  carName: s.carName,
+  carSubtitle: s.carSubtitle,
+  consumptionOkTo: numIn(s.consumptionOkTo),
+  consumptionHighFrom: numIn(s.consumptionHighFrom),
+  fuelPriceGrowth: numIn(+(s.fuelPriceGrowth * 100).toFixed(4)),
+  monthlyKmPlan: numIn(s.monthlyKmPlan),
+  carPrice: numIn(s.carPrice)
+});
+function SectionTitle({
+  children
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.text,
+      margin: "4px 0 12px"
+    }
+  }, children);
+}
 function UstawieniaTab({
   data,
-  setData
+  setData,
+  notify
 }) {
-  const [local, setLocal] = useState(data.settings);
-  const dirty = JSON.stringify(local) !== JSON.stringify(data.settings);
-  const save = () => setData({
-    ...data,
-    settings: local
-  });
+  const [f, setF] = useState(() => settingsToForm(data.settings));
+  const [errors, setErrors] = useState({});
+  const [pendingImport, setPendingImport] = useState(null);
   const fileInputRef = React.useRef(null);
-  const [status, setStatus] = useState(null); // { type: 'ok'|'error', text }
-
+  const dirty = JSON.stringify(f) !== JSON.stringify(settingsToForm(data.settings));
+  const set = key => value => {
+    setF(prev => ({
+      ...prev,
+      [key]: value
+    }));
+    setErrors(prev => ({
+      ...prev,
+      [key]: undefined
+    }));
+  };
+  const save = () => {
+    const r = validate({
+      consumptionOkTo: () => parseNumber(f.consumptionOkTo, {
+        min: 0.1
+      }),
+      consumptionHighFrom: () => parseNumber(f.consumptionHighFrom, {
+        min: 0.1
+      }),
+      fuelPriceGrowth: () => parseNumber(f.fuelPriceGrowth),
+      monthlyKmPlan: () => parseNumber(f.monthlyKmPlan, {
+        min: 0
+      }),
+      carPrice: () => parseNumber(f.carPrice, {
+        min: 0
+      })
+    });
+    if (r.ok && r.values.consumptionHighFrom <= r.values.consumptionOkTo) {
+      r.errors.consumptionHighFrom = "Musi być większe niż próg „w normie”";
+      r.ok = false;
+    }
+    if (!r.ok) return setErrors(r.errors);
+    const v = r.values;
+    setData({
+      ...data,
+      settings: {
+        ...data.settings,
+        carName: f.carName.trim() || "MOJE AUTO",
+        carSubtitle: f.carSubtitle.trim() || "DZIENNIK POKŁADOWY",
+        consumptionOkTo: v.consumptionOkTo,
+        consumptionHighFrom: v.consumptionHighFrom,
+        fuelPriceGrowth: v.fuelPriceGrowth / 100,
+        monthlyKmPlan: v.monthlyKmPlan,
+        carPrice: v.carPrice
+      }
+    });
+    notify("Ustawienia zapisane");
+  };
   const handleExport = async () => {
-    setStatus(null);
     const res = await exportBackup(data);
     if (res.ok && res.method !== "cancelled") {
-      setStatus({
-        type: "ok",
-        text: res.method === "share" ? "Gotowe — wybierz Dysk Google w oknie udostępniania." : "Plik pobrany. Możesz go teraz przenieść na Dysk Google."
-      });
+      notify(res.method === "share" ? "Wybierz Dysk Google w oknie udostępniania" : "Plik kopii pobrany");
     }
   };
-  const handleImportClick = () => fileInputRef.current && fileInputRef.current.click();
   const handleFileChange = async e => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     try {
-      const imported = await readBackupFile(file);
-      setData(imported);
-      setStatus({
-        type: "ok",
-        text: "Dane wczytane z kopii zapasowej."
+      setPendingImport({
+        name: file.name,
+        data: await readBackupFile(file)
       });
     } catch (err) {
-      setStatus({
-        type: "error",
-        text: err.message
-      });
+      notify(err.message, "error");
     }
   };
+  const applyImport = () => {
+    setData(pendingImport.data);
+    setF(settingsToForm(pendingImport.data.settings));
+    notify(`Wczytano ${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}`);
+    setPendingImport(null);
+  };
+  const field = (key, label, suffix, inputMode = "decimal") => /*#__PURE__*/React.createElement(FormField, {
+    label: label,
+    error: errors[key]
+  }, /*#__PURE__*/React.createElement(TextInput, {
+    value: f[key],
+    onChange: set(key),
+    suffix: suffix,
+    inputMode: inputMode,
+    error: errors[key]
+  }));
   return /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
-      gap: 4
+      gap: 10
     }
-  }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(Field, {
-    label: "Nazwa auta (nagłówek)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: local.carName,
-    onChange: e => setLocal({
-      ...local,
-      carName: e.target.value
-    }),
-    placeholder: "np. CUPRA TERRAMAR"
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Podtytuł nagłówka"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    style: inputStyle,
-    value: local.carSubtitle,
-    onChange: e => setLocal({
-      ...local,
-      carSubtitle: e.target.value
-    }),
-    placeholder: "np. DZIENNIK POKŁADOWY"
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Próg spalania — OK do (l/100km)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    step: "0.1",
-    style: inputStyle,
-    value: local.consumptionOkTo,
-    onChange: e => setLocal({
-      ...local,
-      consumptionOkTo: +e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Próg spalania — wysokie od (l/100km)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    step: "0.1",
-    style: inputStyle,
-    value: local.consumptionHighFrom,
-    onChange: e => setLocal({
-      ...local,
-      consumptionHighFrom: +e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Wzrost cen paliwa (rocznie, np. 0.05 = 5%)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    step: "0.01",
-    style: inputStyle,
-    value: local.fuelPriceGrowth,
-    onChange: e => setLocal({
-      ...local,
-      fuelPriceGrowth: +e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Przebieg miesięczny do symulacji (km)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    style: inputStyle,
-    value: local.monthlyKmPlan,
-    onChange: e => setLocal({
-      ...local,
-      monthlyKmPlan: +e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(Field, {
-    label: "Cena auta / baza amortyzacji (zł)"
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    style: inputStyle,
-    value: local.carPrice,
-    onChange: e => setLocal({
-      ...local,
-      carPrice: +e.target.value
-    })
-  })), /*#__PURE__*/React.createElement(PrimaryButton, {
+  }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(SectionTitle, null, "Pojazd"), field("carName", "Nazwa auta", null, "text"), field("carSubtitle", "Podtytuł", null, "text"), field("carPrice", "Cena auta", "zł")), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(SectionTitle, null, "Progi spalania"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, field("consumptionOkTo", "W normie do", "l/100"), field("consumptionHighFrom", "Wysokie od", "l/100")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(Pill, {
+    text: "W normie",
+    color: C.green
+  }), /*#__PURE__*/React.createElement(Pill, {
+    text: "Podwyższone",
+    color: C.amber
+  }), /*#__PURE__*/React.createElement(Pill, {
+    text: "Wysokie",
+    color: C.red
+  }))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(SectionTitle, null, "Prognoza"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 10
+    }
+  }, field("monthlyKmPlan", "Przebieg miesięczny", "km", "numeric"), field("fuelPriceGrowth", "Wzrost cen paliwa", "%/rok"))), /*#__PURE__*/React.createElement(PrimaryButton, {
     onClick: save,
     disabled: !dirty
-  }, "Zapisz ustawienia")), /*#__PURE__*/React.createElement(Card, {
+  }, "Zapisz ustawienia"), /*#__PURE__*/React.createElement(Card, {
     style: {
-      marginTop: 10
+      marginTop: 6
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 13,
-      fontWeight: 600,
-      color: C.text,
-      marginBottom: 4
-    }
-  }, "Kopia zapasowa"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(SectionTitle, null, "Kopia zapasowa"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.textFaint,
+      marginTop: -6,
       marginBottom: 12,
       lineHeight: 1.5
     }
-  }, "Zapisz wszystkie dane do pliku i przenieś go np. na Dysk Google, albo wczytaj wcześniej zapisaną kopię."), /*#__PURE__*/React.createElement("div", {
+  }, "Zapisz wszystkie dane do pliku (np. na Dysk Google) albo wczytaj wcześniej zapisaną kopię. Plik jest zgodny z wersją desktopową."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8
@@ -2280,7 +2926,7 @@ function UstawieniaTab({
       justifyContent: "center"
     }
   }, "Eksportuj dane"), /*#__PURE__*/React.createElement("button", {
-    onClick: handleImportClick,
+    onClick: () => fileInputRef.current && fileInputRef.current.click(),
     style: {
       ...toggleBtn(false),
       flex: 1
@@ -2293,20 +2939,21 @@ function UstawieniaTab({
       display: "none"
     },
     onChange: handleFileChange
-  }), status && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10,
-      fontSize: 12,
-      color: status.type === "error" ? C.red : C.green
-    }
-  }, status.text)), /*#__PURE__*/React.createElement("div", {
+  })), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11.5,
       color: C.textFaint,
-      padding: "10px 4px",
+      padding: "4px 4px 10px",
       lineHeight: 1.5
     }
-  }, "Dane są zapisywane bezpośrednio w pamięci tej przeglądarki na Twoim telefonie (localStorage) — zostają nawet po zamknięciu aplikacji. Kopia zapasowa to jedyny sposób, by przenieść je na inne urządzenie."));
+  }, "Dane są zapisywane bezpośrednio w pamięci tej przeglądarki na Twoim telefonie (localStorage) — zostają nawet po zamknięciu aplikacji. Kopia zapasowa to jedyny sposób, by przenieść je na inne urządzenie."), pendingImport && /*#__PURE__*/React.createElement(ConfirmSheet, {
+    title: "Wczytać kopię?",
+    message: `Obecne dane zostaną zastąpione zawartością pliku ${pendingImport.name} (${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}, ${plural(pendingImport.data.serwisy.length, "serwis", "serwisy", "serwisów")}, ${plural(pendingImport.data.koszty.length, "koszt", "koszty", "kosztów")}).`,
+    confirmText: "Wczytaj",
+    danger: false,
+    onCancel: () => setPendingImport(null),
+    onConfirm: applyImport
+  }));
 }
 
 /* ---------- APP SHELL ---------- */
@@ -2345,6 +2992,17 @@ function CarDashboardApp() {
     error
   } = useCarData();
   const [tab, setTab] = useState("dashboard");
+  const [toast, setToast] = useState(null);
+  const notify = useCallback((text, kind = "ok") => setToast({
+    text,
+    kind,
+    at: Date.now()
+  }), []);
+  useEffect(() => {
+    if (!toast) return undefined;
+    const t = setTimeout(() => setToast(null), 2600);
+    return () => clearTimeout(t);
+  }, [toast]);
   const agg = useAggregates(data || EMPTY_DATA);
   // data is null on the first render (loaded in useEffect)
   const settings = (data || EMPTY_DATA).settings;
@@ -2379,21 +3037,15 @@ function CarDashboardApp() {
       alignItems: "center",
       gap: 10
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("img", {
+    src: "emblem.png",
+    alt: "",
     style: {
-      width: 38,
-      height: 38,
-      borderRadius: 10,
-      background: C.copper + "22",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      border: `1px solid ${C.copperDim}`
+      height: 30,
+      width: "auto",
+      display: "block"
     }
-  }, /*#__PURE__*/React.createElement(Icon.car, {
-    size: 19,
-    color: C.copper
-  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "'Space Grotesk', sans-serif",
       fontSize: 18,
@@ -2428,23 +3080,30 @@ function CarDashboardApp() {
     }
   }, error), !loading && data && /*#__PURE__*/React.createElement(React.Fragment, null, tab === "dashboard" && /*#__PURE__*/React.createElement(Dashboard, {
     agg: agg,
-    settings: data.settings
+    settings: data.settings,
+    tankowania: data.tankowania
   }), tab === "tankowania" && /*#__PURE__*/React.createElement(TankowaniaTab, {
     data: data,
-    setData: setData
+    setData: setData,
+    notify: notify
   }), tab === "serwisy" && /*#__PURE__*/React.createElement(SerwisyTab, {
     data: data,
-    setData: setData
+    setData: setData,
+    notify: notify
   }), tab === "koszty" && /*#__PURE__*/React.createElement(KosztyTab, {
     data: data,
-    setData: setData
+    setData: setData,
+    notify: notify
   }), tab === "prognoza" && /*#__PURE__*/React.createElement(PrognozaTab, {
     agg: agg,
     settings: data.settings
   }), tab === "ustawienia" && /*#__PURE__*/React.createElement(UstawieniaTab, {
     data: data,
-    setData: setData
-  }))), /*#__PURE__*/React.createElement("nav", {
+    setData: setData,
+    notify: notify
+  }))), /*#__PURE__*/React.createElement(Toast, {
+    toast: toast
+  }), /*#__PURE__*/React.createElement("nav", {
     style: {
       position: "fixed",
       bottom: 0,
@@ -2505,7 +3164,7 @@ function CarDashboardApp() {
 function App() {
   return /*#__PURE__*/React.createElement(ErrorBoundary, null, /*#__PURE__*/React.createElement(CarDashboardApp, null));
 }
-ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
+ReactDOM.createRoot(document.getElementById("root")).render( /*#__PURE__*/React.createElement(App, null));
 </script>
 <script>
   if ("serviceWorker" in navigator) {
