@@ -699,7 +699,7 @@ class Dialog(ctk.CTkToplevel):
                                 image=icon(icon_name, C["copper"], 18))
             chip.pack(side="left", padx=(0, 12))
         tk.Label(head, text=title, fg=C["text"], bg=bg, font=tk_font(self, 18, "semibold", True)).pack(side="left")
-        icon_button(head, "close", self.close).pack(side="right")
+        # no close button here: the title bar already has one (and Esc / Anuluj close too)
 
         self.body = tk.Frame(self, bg=bg)
         self.body.pack(fill="both", expand=True, padx=24, pady=(8, 0))
