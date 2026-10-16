@@ -15,6 +15,10 @@ URUCHOMIENIE
 3. Uruchom aplikację:
        py cupra_terramar_gui.py
 
+   Skróty bez okna konsoli (Menu Start + pulpit, Windows):
+       powershell -ExecutionPolicy Bypass -File tools\install_shortcuts.ps1
+   Do paska zadań przypinaj okno uruchomione z takiego skrótu albo pozycję z Menu Start.
+
 DANE
 ----
 Dane zapisują się automatycznie w pliku:
