@@ -1,8 +1,10 @@
-const CACHE = "cupra-terramar-v11";
-const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./emblem.png"];
+const CACHE = "cupra-terramar-v12";
+const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./emblem.png",
+  "./apple-touch-icon.png", "./favicon-16.png", "./favicon-32.png"];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).catch(() => {}));
+  // cache: "reload" — a new version must not pick up an older icon from the browser's HTTP cache
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: "reload" })))).catch(() => {}));
   self.skipWaiting();
 });
 
