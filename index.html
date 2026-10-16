@@ -1064,6 +1064,12 @@ const withPrices = list => list.map(t => {
     pricePerL: p
   };
 });
+// the same real event recorded on two devices (different IDs)
+const SAME_EVENT = {
+  tankowania: (a, b) => a.mileage === b.mileage,
+  serwisy: (a, b) => a.date === b.date && (a.description === b.description || !!a.mileage && a.mileage === b.mileage),
+  koszty: (a, b) => a.date === b.date && a.type === b.type && a.amount === b.amount
+};
 async function syncWithSheet(localData, ops, firstConnect, token) {
   const remote = await pullSheet(token);
   if (remote.invalid.length) {
@@ -1079,19 +1085,21 @@ async function syncWithSheet(localData, ops, firstConnect, token) {
   });
   let pending = ops;
   if (firstConnect) {
-    // first connection: keep entries that exist only on this device; the sheet wins for everything else
+    // first connection: keep entries that exist only on this device; the sheet wins for everything else.
+    // An entry typed separately on each device has different IDs, so it is also matched by content.
+    const inSheet = (c, e) => base[c].some(r => r.id === e.id || SAME_EVENT[c](r, e));
     const extra = [];
     COLLECTIONS.forEach(c => {
-      const ids = new Set(base[c].map(e => e.id));
       localData[c].forEach(e => {
-        if (!ids.has(e.id)) extra.push({
+        if (!inSheet(c, e)) extra.push({
           type: "upsert",
           coll: c,
           entry: e
         });
       });
     });
-    pending = [...extra, ...ops.filter(op => op.type !== "settings")];
+    const known = op => op.type === "upsert" && !base[op.coll].some(r => r.id === op.entry.id) && inSheet(op.coll, op.entry);
+    pending = [...extra, ...ops.filter(op => op.type !== "settings" && !known(op))];
   }
   const merged = applyOps(base, pending);
   merged.tankowania = withPrices(merged.tankowania);
