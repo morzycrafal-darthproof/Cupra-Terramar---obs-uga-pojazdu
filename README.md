@@ -32,3 +32,16 @@ py build.py
 Skrypt kompiluje JSX Babelem (`runtime: 'classic'`, bez modułów ES), składa `index.html`
 i — jeśli plik się zmienił — podbija `cupra-terramar-vN` w `sw.js`, żeby telefon pobrał nową wersję.
 Opcje: `--no-bump` (bez zmiany `sw.js`), `--compiled plik.js` (pomija Babela).
+
+## Synchronizacja z Arkuszem Google
+
+Wspólnym źródłem danych jest arkusz „Cupra Terramar - dane” na Dysku Google
+(ID i identyfikator klienta OAuth: stała `GOOGLE` w `src/app.jsx`).
+
+- Aplikacja działa na kopii lokalnej; każda zmiana trafia do kolejki. Synchronizacja pobiera arkusz,
+  nakłada kolejkę, przelicza dystans / spalanie i zapisuje zakładki, które się zmieniły.
+- Pierwsze połączenie dopisuje do arkusza wpisy, które są tylko na urządzeniu; w pozostałych wygrywa arkusz.
+- Wiersz, którego nie da się odczytać, blokuje zapis (nic nie zostanie nadpisane) do czasu poprawki.
+- Logowanie: przekierowanie OAuth (token na godzinę, odnawiany bez pytania przez `prompt=none`).
+  Adresy powrotu muszą być wpisane w kliencie „Cupra PWA” w Google Cloud.
+- Testy na kopii arkusza: `localStorage["cupra-terramar-sheet-override"] = "<ID kopii>"`.

@@ -419,21 +419,444 @@ function readBackupFile(file) {
     reader.readAsText(file);
   });
 }
+/* ---------- GOOGLE SHEETS SYNC ----------
+ * The Google Sheet is the shared source of truth (phone + desktop). The app keeps working on its local
+ * copy; every change is queued as an operation. A sync pulls the sheet, applies the queued operations on
+ * top of it, recomputes distances, writes back the tabs that changed and adopts the result locally — so an
+ * entry added on another device in the meantime is never overwritten.
+ * Sign-in uses the OAuth implicit flow with a full-page redirect (popups are unreliable in an installed
+ * PWA on Android); the access token lives for an hour and is renewed with prompt=none.
+ */
+const GOOGLE = {
+  clientId: "381548523018-sva56q3badtq0tuaqipd44elv1u33nj9.apps.googleusercontent.com",
+  sheetId: "1qIYl3xkVN4EK62Zd_z_w_QyJvh-HVQv5-0ZD4WCvWgw",
+  scope: "https://www.googleapis.com/auth/spreadsheets"
+};
+const SYNC_KEY = "cupra-terramar-sync-v1"; // { connected, firstDone, ops, lastSync }
+const TOKEN_KEY = "cupra-terramar-google-token"; // { token, exp }
+const AUTH_STATE_KEY = "cupra-terramar-google-state";
+const SILENT_KEY = "cupra-terramar-google-silent-at";
+const COLLECTIONS = ["tankowania", "serwisy", "koszty"];
+const readJson = (key, fallback) => {
+  try {
+    return JSON.parse(window.localStorage.getItem(key)) ?? fallback;
+  } catch (e) {
+    return fallback;
+  }
+};
+const writeJson = (key, value) => {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {/* storage full or blocked: the in-memory state still works */}
+};
+const sheetId = () => window.localStorage.getItem("cupra-terramar-sheet-override") || GOOGLE.sheetId;
+
+/* --- auth --- */
+function validToken() {
+  const t = readJson(TOKEN_KEY, null);
+  return t && t.exp > Date.now() ? t.token : null;
+}
+function redirectUri() {
+  return window.location.origin + window.location.pathname;
+}
+function startGoogleLogin(silent) {
+  const state = uid() + uid();
+  window.localStorage.setItem(AUTH_STATE_KEY, state);
+  if (silent) window.localStorage.setItem(SILENT_KEY, String(Date.now()));
+  const params = new URLSearchParams({
+    client_id: GOOGLE.clientId,
+    redirect_uri: redirectUri(),
+    response_type: "token",
+    scope: GOOGLE.scope,
+    include_granted_scopes: "true",
+    state
+  });
+  if (silent) params.set("prompt", "none");
+  window.location.assign(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+}
+
+// back from Google: #access_token=...&expires_in=...&state=... or #error=...
+function consumeAuthRedirect() {
+  const hash = window.location.hash.slice(1);
+  if (!hash || !/(access_token|error)=/.test(hash)) return null;
+  const p = new URLSearchParams(hash);
+  window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  const expected = window.localStorage.getItem(AUTH_STATE_KEY);
+  window.localStorage.removeItem(AUTH_STATE_KEY);
+  if (!expected || p.get("state") !== expected) return {
+    error: "state_mismatch"
+  };
+  if (p.get("error")) return {
+    error: p.get("error")
+  };
+  writeJson(TOKEN_KEY, {
+    token: p.get("access_token"),
+    exp: Date.now() + (Number(p.get("expires_in")) || 3600) * 1000 - 60000
+  });
+  return {
+    ok: true
+  };
+}
+
+/* --- sheet <-> app rows --- */
+const SERIAL_EPOCH = Date.UTC(1899, 11, 30);
+const isoToSerial = iso => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return (Date.UTC(y, m - 1, d) - SERIAL_EPOCH) / 86400000;
+};
+function cellDate(v) {
+  if (typeof v === "number" && v > 0) {
+    const d = new Date(SERIAL_EPOCH + Math.round(v) * 86400000);
+    return d.toISOString().slice(0, 10);
+  }
+  const s = String(v ?? "").trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return s;
+  m = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
+  if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  return null;
+}
+function cellNumber(v, optional = false) {
+  if (typeof v === "number") return v;
+  if (v === undefined || v === null || String(v).trim() === "") return optional ? null : NaN;
+  const n = tryNumber(String(v));
+  return n === null ? NaN : n;
+}
+const cellText = v => v === undefined || v === null ? "" : String(v).trim();
+const yes = v => /^(tak|t|yes|true|1)$/i.test(cellText(v));
+const TABLES = [{
+  coll: "tankowania",
+  tab: "Tankowania",
+  lastCol: "J",
+  order: (a, b) => byDateMileage(a, b), // defined further down; resolved at call time
+  toRow: t => [t.id, isoToSerial(t.date), t.fuelType, t.liters, t.cost, t.pricePerL, t.mileage, t.distance ?? "", t.consumption ?? "", t.note || ""],
+  fromRow: r => {
+    const e = {
+      id: cellText(r[0]),
+      date: cellDate(r[1]),
+      fuelType: cellText(r[2]) || "Pb98",
+      liters: cellNumber(r[3]),
+      cost: cellNumber(r[4]),
+      mileage: cellNumber(r[6]),
+      note: cellText(r[9])
+    };
+    if (!e.date || !(e.liters > 0) || Number.isNaN(e.cost) || Number.isNaN(e.mileage)) return null;
+    // as stored in the sheet; recalcTankowania / withPrices bring them in line afterwards
+    return {
+      ...e,
+      pricePerL: cellNumber(r[5], true),
+      distance: cellNumber(r[7], true),
+      consumption: cellNumber(r[8], true)
+    };
+  }
+}, {
+  coll: "serwisy",
+  tab: "Serwisy",
+  lastCol: "H",
+  order: (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0,
+  toRow: s => [s.id, isoToSerial(s.date), s.mileage ?? "", s.description, s.price, s.warranty ? "TAK" : "NIE", s.paidCost, s.note || ""],
+  fromRow: r => {
+    const price = cellNumber(r[4], true) ?? 0;
+    const warranty = yes(r[5]);
+    const e = {
+      id: cellText(r[0]),
+      date: cellDate(r[1]),
+      mileage: cellNumber(r[2], true),
+      description: cellText(r[3]),
+      price,
+      warranty,
+      paidCost: warranty ? 0 : price,
+      note: cellText(r[7])
+    };
+    if (!e.date || !e.description || Number.isNaN(e.price) || Number.isNaN(e.mileage)) return null;
+    return e;
+  }
+}, {
+  coll: "koszty",
+  tab: "Koszty",
+  lastCol: "G",
+  order: (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0,
+  toRow: k => [k.id, isoToSerial(k.date), k.type, k.description, k.amount, k.oneTime === false ? "NIE" : "TAK", k.note || ""],
+  fromRow: r => {
+    const type = cellText(r[2]) || "Inne";
+    const e = {
+      id: cellText(r[0]),
+      date: cellDate(r[1]),
+      type,
+      description: cellText(r[3]) || type,
+      amount: cellNumber(r[4]),
+      oneTime: cellText(r[5]) ? yes(r[5]) : true,
+      note: cellText(r[6])
+    };
+    if (!e.date || Number.isNaN(e.amount)) return null;
+    return e;
+  }
+}];
+const SETTING_KEYS = ["carName", "carSubtitle", "consumptionOkTo", "consumptionHighFrom", "fuelPriceGrowth", "monthlyKmPlan", "carPrice"];
+
+/* --- Sheets API --- */
+async function sheetsApi(token, path, init = {}) {
+  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId()}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    }
+  });
+  if (res.status === 401) {
+    window.localStorage.removeItem(TOKEN_KEY);
+    const err = new Error("Sesja Google wygasła — zaloguj się ponownie.");
+    err.auth = true;
+    throw err;
+  }
+  if (!res.ok) {
+    let msg = `Błąd Google Sheets (${res.status})`;
+    try {
+      msg += `: ${(await res.json()).error.message}`;
+    } catch (e) {/* no JSON body */}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+async function pullSheet(token) {
+  const ranges = [...TABLES.map(t => `${t.tab}!A2:${t.lastCol}`), "Ustawienia!A2:B"];
+  const q = new URLSearchParams({
+    valueRenderOption: "UNFORMATTED_VALUE",
+    dateTimeRenderOption: "SERIAL_NUMBER"
+  });
+  ranges.forEach(r => q.append("ranges", r));
+  const res = await sheetsApi(token, `/values:batchGet?${q}`);
+  const out = {
+    data: {
+      settings: {}
+    },
+    rowCount: {},
+    needsRewrite: {},
+    invalid: [],
+    settingRows: {}
+  };
+  TABLES.forEach((t, i) => {
+    const rows = res.valueRanges[i].values || [];
+    out.rowCount[t.tab] = rows.length;
+    out.data[t.coll] = [];
+    rows.forEach((r, j) => {
+      if (!r.some(c => cellText(c) !== "")) return; // empty row
+      const e = t.fromRow(r);
+      if (!e) return out.invalid.push(`${t.tab}, wiersz ${j + 2}`);
+      if (!e.id) {
+        e.id = uid(); // typed by hand in the sheet: give it an ID and write it back
+        out.needsRewrite[t.tab] = true;
+      }
+      out.data[t.coll].push(e);
+    });
+  });
+  (res.valueRanges[TABLES.length].values || []).forEach((r, j) => {
+    const key = cellText(r[0]);
+    if (!SETTING_KEYS.includes(key)) return;
+    out.settingRows[key] = j + 2;
+    const v = r[1];
+    out.data.settings[key] = key === "carName" || key === "carSubtitle" ? cellText(v) : cellNumber(v);
+  });
+  return out;
+}
+
+/* --- operations queue --- */
+const sameEntry = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+function diffOps(prev, next) {
+  const ops = [];
+  COLLECTIONS.forEach(coll => {
+    const before = new Map((prev?.[coll] || []).map(e => [e.id, e]));
+    const after = new Map(next[coll].map(e => [e.id, e]));
+    after.forEach((e, id) => {
+      if (!sameEntry(before.get(id), e)) ops.push({
+        type: "upsert",
+        coll,
+        entry: e
+      });
+    });
+    before.forEach((e, id) => {
+      if (!after.has(id)) ops.push({
+        type: "delete",
+        coll,
+        id
+      });
+    });
+  });
+  if (prev && !sameEntry(prev.settings, next.settings)) ops.push({
+    type: "settings",
+    settings: next.settings
+  });
+  return ops;
+}
+const opKey = op => op.type === "settings" ? "settings" : `${op.coll}:${op.type === "delete" ? op.id : op.entry.id}`;
+// only the latest operation per entry matters
+const compactOps = ops => {
+  const last = new Map();
+  ops.forEach(op => {
+    last.delete(opKey(op));
+    last.set(opKey(op), op);
+  });
+  return [...last.values()];
+};
+function applyOps(data, ops) {
+  const d = {
+    ...data,
+    settings: {
+      ...data.settings
+    }
+  };
+  COLLECTIONS.forEach(c => {
+    d[c] = [...data[c]];
+  });
+  ops.forEach(op => {
+    if (op.type === "settings") d.settings = {
+      ...d.settings,
+      ...op.settings
+    };else if (op.type === "delete") d[op.coll] = d[op.coll].filter(e => e.id !== op.id);else {
+      const i = d[op.coll].findIndex(e => e.id === op.entry.id);
+      if (i >= 0) d[op.coll][i] = op.entry;else d[op.coll].push(op.entry);
+    }
+  });
+  d.tankowania = recalcTankowania(d.tankowania);
+  return d;
+}
+
+/* --- one sync round --- */
+const withPrices = list => list.map(t => {
+  const p = +(t.cost / t.liters).toFixed(3);
+  return t.pricePerL === p ? t : {
+    ...t,
+    pricePerL: p
+  };
+});
+async function syncWithSheet(localData, ops, firstConnect, token) {
+  const remote = await pullSheet(token);
+  if (remote.invalid.length) {
+    throw new Error(`W arkuszu są wiersze, których nie da się odczytać (${remote.invalid.slice(0, 3).join("; ")}${remote.invalid.length > 3 ? "…" : ""}). Popraw je — do tego czasu nic nie zostanie nadpisane.`);
+  }
+  const remoteSettings = Object.fromEntries(Object.entries(remote.data.settings).filter(([, v]) => v !== "" && !Number.isNaN(v)));
+  const base = sanitize({
+    ...remote.data,
+    settings: {
+      ...localData.settings,
+      ...remoteSettings
+    }
+  });
+  let pending = ops;
+  if (firstConnect) {
+    // first connection: keep entries that exist only on this device; the sheet wins for everything else
+    const extra = [];
+    COLLECTIONS.forEach(c => {
+      const ids = new Set(base[c].map(e => e.id));
+      localData[c].forEach(e => {
+        if (!ids.has(e.id)) extra.push({
+          type: "upsert",
+          coll: c,
+          entry: e
+        });
+      });
+    });
+    pending = [...extra, ...ops.filter(op => op.type !== "settings")];
+  }
+  const merged = applyOps(base, pending);
+  merged.tankowania = withPrices(merged.tankowania);
+
+  // rewrite a tab only when its sorted, recomputed rows differ from what the sheet holds now
+  const clears = [],
+    data = [];
+  TABLES.forEach(t => {
+    const rows = [...merged[t.coll]].sort(t.order).map(t.toRow);
+    const current = remote.data[t.coll].map(t.toRow);
+    const gaps = remote.rowCount[t.tab] !== remote.data[t.coll].length;
+    if (!remote.needsRewrite[t.tab] && !gaps && sameEntry(rows, current)) return;
+    if (rows.length) data.push({
+      range: `${t.tab}!A2`,
+      values: rows
+    });
+    if (remote.rowCount[t.tab] > rows.length) clears.push(`${t.tab}!A${rows.length + 2}:${t.lastCol}${remote.rowCount[t.tab] + 1}`);
+  });
+  let nextRow = Math.max(1, ...Object.values(remote.settingRows)) + 1;
+  SETTING_KEYS.forEach(k => {
+    if (sameEntry(merged.settings[k], remote.data.settings[k])) return;
+    const row = remote.settingRows[k] || nextRow++;
+    data.push({
+      range: `Ustawienia!A${row}:B${row}`,
+      values: [[k, merged.settings[k]]]
+    });
+  });
+  if (clears.length) await sheetsApi(token, "/values:batchClear", {
+    method: "POST",
+    body: JSON.stringify({
+      ranges: clears
+    })
+  });
+  if (data.length) await sheetsApi(token, "/values:batchUpdate", {
+    method: "POST",
+    body: JSON.stringify({
+      valueInputOption: "RAW",
+      data
+    })
+  });
+  return {
+    data: merged,
+    wrote: data.length + clears.length > 0
+  };
+}
 function useCarData() {
   const [data, setDataState] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [meta, setMeta] = useState(() => readJson(SYNC_KEY, {
+    connected: false,
+    firstDone: false,
+    ops: [],
+    lastSync: null
+  }));
+  const [syncStatus, setSyncStatus] = useState({
+    state: "idle",
+    message: null
+  });
+  const dataRef = useRef(null);
+  const metaRef = useRef(meta);
+  const busyRef = useRef(false);
+  const updateMeta = useCallback(patch => {
+    const next = {
+      ...metaRef.current,
+      ...(typeof patch === "function" ? patch(metaRef.current) : patch)
+    };
+    metaRef.current = next;
+    writeJson(SYNC_KEY, next);
+    setMeta(next);
+  }, []);
+  const adopt = useCallback(clean => {
+    dataRef.current = clean;
+    setDataState(clean);
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
+    } catch (e) {
+      setError("Zmiana zapisana tymczasowo, ale nie udało się jej utrwalić na dysku.");
+    }
+  }, []);
   useEffect(() => {
+    const auth = consumeAuthRedirect();
+    if (auth?.ok) updateMeta({
+      connected: true
+    });
+    if (auth?.error && auth.error !== "state_mismatch") {
+      setSyncStatus({
+        state: "auth",
+        message: auth.error === "access_denied" ? "Nie udzielono dostępu do arkusza." : "Zaloguj się do Google, żeby zsynchronizować dane."
+      });
+    }
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) setDataState(sanitize(JSON.parse(raw)));else {
+      if (raw) adopt(sanitize(JSON.parse(raw)));else {
         const seed = sanitize(null);
-        setDataState(seed);
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(seed));
+        adopt(seed);
       }
     } catch (e) {
       setError("Nie udało się wczytać zapisanych danych z pamięci telefonu. Startuję z danymi przykładowymi.");
-      setDataState(sanitize(null));
+      adopt(sanitize(null));
     } finally {
       setLoading(false);
     }
@@ -444,18 +867,118 @@ function useCarData() {
       ...sane,
       tankowania: recalcTankowania(sane.tankowania)
     };
-    setDataState(clean);
+    const ops = diffOps(dataRef.current, clean);
+    if (ops.length) updateMeta(m => ({
+      ops: compactOps([...m.ops, ...ops])
+    }));
+    adopt(clean);
+  }, []);
+  const sync = useCallback(async () => {
+    const m = metaRef.current;
+    if (!m.connected || busyRef.current || !dataRef.current) return;
+    const token = validToken();
+    if (!token) return setSyncStatus({
+      state: "auth",
+      message: "Zaloguj się do Google, żeby zsynchronizować dane."
+    });
+    if (!navigator.onLine) return setSyncStatus({
+      state: "offline",
+      message: null
+    });
+    busyRef.current = true;
+    setSyncStatus({
+      state: "syncing",
+      message: null
+    });
+    const sentOps = m.ops;
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(clean));
+      const res = await syncWithSheet(dataRef.current, sentOps, !m.firstDone, token);
+      // edits made while the request was running stay queued and are applied on top
+      const later = metaRef.current.ops.slice(sentOps.length);
+      adopt(later.length ? applyOps(res.data, later) : res.data);
+      updateMeta({
+        ops: later,
+        firstDone: true,
+        lastSync: Date.now()
+      });
+      setSyncStatus({
+        state: "ok",
+        message: null
+      });
     } catch (e) {
-      setError("Zmiana zapisana tymczasowo, ale nie udało się jej utrwalić na dysku.");
+      setSyncStatus({
+        state: e.auth ? "auth" : "error",
+        message: e.message || "Synchronizacja nie powiodła się."
+      });
+    } finally {
+      busyRef.current = false;
     }
+  }, []);
+  const connect = useCallback(() => {
+    updateMeta({
+      connected: true
+    });
+    startGoogleLogin(false);
+  }, []);
+  const disconnect = useCallback(() => {
+    window.localStorage.removeItem(TOKEN_KEY);
+    updateMeta({
+      connected: false,
+      firstDone: false
+    });
+    setSyncStatus({
+      state: "idle",
+      message: null
+    });
+  }, []);
+
+  // after start-up: sync now, or renew an expired token without user interaction (one redirect)
+  useEffect(() => {
+    if (loading || !meta.connected) return;
+    if (validToken()) {
+      sync();
+      return;
+    }
+    const lastSilent = Number(window.localStorage.getItem(SILENT_KEY) || 0);
+    const stale = !meta.lastSync || Date.now() - meta.lastSync > 10 * 60 * 1000 || meta.ops.length > 0;
+    if (navigator.onLine && stale && Date.now() - lastSilent > 5 * 60 * 1000) startGoogleLogin(true);else setSyncStatus({
+      state: "auth",
+      message: "Zaloguj się do Google, żeby zsynchronizować dane."
+    });
+  }, [loading]);
+  // queued changes go out shortly after they are made
+  useEffect(() => {
+    if (loading || !meta.connected || !meta.ops.length || !validToken()) return undefined;
+    const t = setTimeout(sync, 1500);
+    return () => clearTimeout(t);
+  }, [meta.ops, loading]);
+  // back online / back to the app
+  useEffect(() => {
+    const again = () => {
+      if (document.visibilityState === "visible" && metaRef.current.connected && validToken()) sync();
+    };
+    window.addEventListener("online", again);
+    document.addEventListener("visibilitychange", again);
+    return () => {
+      window.removeEventListener("online", again);
+      document.removeEventListener("visibilitychange", again);
+    };
   }, []);
   return {
     data,
     setData,
     loading,
-    error
+    error,
+    sync: {
+      ...syncStatus,
+      connected: meta.connected,
+      pending: meta.ops.length,
+      lastSync: meta.lastSync,
+      run: sync,
+      connect,
+      login: () => startGoogleLogin(false),
+      disconnect
+    }
   };
 }
 
@@ -2718,6 +3241,205 @@ function PrognozaTab({
   );
 }
 
+/* ---------- SYNC UI ---------- */
+const SYNC_LABEL = {
+  syncing: "Synchronizacja…",
+  offline: "Offline",
+  auth: "Zaloguj do Google",
+  error: "Błąd synchronizacji"
+};
+function syncLabel(sync) {
+  if (SYNC_LABEL[sync.state]) return SYNC_LABEL[sync.state] + (sync.state === "offline" && sync.pending ? ` · ${sync.pending}` : "");
+  if (sync.pending) return `Do wysłania: ${sync.pending}`;
+  return sync.lastSync ? "Zsynchronizowano" : "Arkusz Google";
+}
+// the header badge has little room next to the car name
+const SYNC_SHORT = {
+  syncing: "Synchr.…",
+  offline: "Offline",
+  auth: "Zaloguj",
+  error: "Błąd"
+};
+function syncShortLabel(sync) {
+  if (sync.state === "offline" && sync.pending) return `Offline · ${sync.pending}`;
+  if (SYNC_SHORT[sync.state]) return SYNC_SHORT[sync.state];
+  return sync.pending ? `↑ ${sync.pending}` : "Arkusz";
+}
+function syncColor(sync) {
+  if (sync.state === "error") return C.red;
+  if (sync.state === "auth" || sync.state === "offline") return C.amber;
+  if (sync.state === "ok" && !sync.pending) return C.green;
+  return C.textDim;
+}
+function SyncBadge({
+  sync
+}) {
+  if (!sync.connected) return null;
+  const color = syncColor(sync);
+  return (
+    <button
+      onClick={sync.state === "auth" ? sync.login : sync.run}
+      style={{
+        marginLeft: "auto",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        background: "none",
+        border: `1px solid ${C.line}`,
+        borderRadius: 999,
+        padding: "5px 10px",
+        color,
+        fontSize: 11.5,
+        cursor: "pointer",
+        whiteSpace: "nowrap"
+      }}
+    >
+      <span
+        style={{
+          width: 7,
+          height: 7,
+          borderRadius: 99,
+          background: color,
+          opacity: sync.state === "syncing" ? 0.5 : 1
+        }}
+      />
+      {syncShortLabel(sync)}
+    </button>
+  );
+}
+function SyncCard({
+  sync
+}) {
+  const [confirmOff, setConfirmOff] = useState(false);
+  const row = (label, value, color) => (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        fontSize: 12.5,
+        padding: "4px 0"
+      }}
+    >
+      <span
+        style={{
+          color: C.textDim
+        }}
+      >
+        {label}
+      </span>
+      <span
+        style={{
+          color: color || C.text
+        }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+  const last = sync.lastSync ? new Date(sync.lastSync).toLocaleString("pl-PL", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }) : "jeszcze nie";
+  return (
+    <Card>
+      <SectionTitle>Arkusz Google</SectionTitle>
+      {!sync.connected ? (
+        <>
+          <div
+            style={{
+              fontSize: 12,
+              color: C.textFaint,
+              lineHeight: 1.5,
+              marginTop: -6,
+              marginBottom: 10
+            }}
+          >
+            Połącz aplikację z arkuszem „Cupra Terramar - dane” na Twoim Dysku Google. Wpisy z telefonu i komputera będą się wzajemnie uzupełniać. Przy pierwszym połączeniu wpisy, które są tylko na tym telefonie, zostaną dopisane do arkusza.
+          </div>
+          <PrimaryButton onClick={sync.connect}>Połącz z Google</PrimaryButton>
+        </>
+      ) : (
+        <>
+          {row("Stan", syncLabel(sync), syncColor(sync))}
+          {row("Ostatnia synchronizacja", last)}
+          {row("Zmiany do wysłania", sync.pending)}
+          {sync.message && (
+            <div
+              style={{
+                color: sync.state === "error" ? C.red : C.amber,
+                fontSize: 12,
+                lineHeight: 1.45,
+                margin: "6px 0 2px"
+              }}
+            >
+              {sync.message}
+            </div>
+          )}
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              marginTop: 10
+            }}
+          >
+            <button
+              onClick={sync.state === "auth" ? sync.login : sync.run}
+              style={{
+                ...addBtnStyle,
+                flex: 1,
+                justifyContent: "center"
+              }}
+            >
+              {sync.state === "auth" ? "Zaloguj do Google" : "Synchronizuj teraz"}
+            </button>
+            <a
+              href={`https://docs.google.com/spreadsheets/d/${sheetId()}/edit`}
+              target="_blank"
+              rel="noopener"
+              style={{
+                ...toggleBtn(false),
+                flex: 1,
+                textAlign: "center",
+                textDecoration: "none"
+              }}
+            >
+              Otwórz arkusz
+            </a>
+          </div>
+          <button
+            onClick={() => setConfirmOff(true)}
+            style={{
+              background: "none",
+              border: "none",
+              color: C.textFaint,
+              fontSize: 12,
+              marginTop: 10,
+              padding: 0,
+              cursor: "pointer"
+            }}
+          >
+            Odłącz od arkusza
+          </button>
+        </>
+      )}
+      {confirmOff && (
+        <ConfirmSheet
+          title="Odłączyć arkusz?"
+          message="Dane zostaną na telefonie, ale zmiany przestaną trafiać do arkusza Google. Możesz połączyć się ponownie w każdej chwili."
+          confirmText="Odłącz"
+          onCancel={() => setConfirmOff(false)}
+          onConfirm={() => {
+            sync.disconnect();
+            setConfirmOff(false);
+          }}
+        />
+      )}
+    </Card>
+  );
+}
+
 /* ---------- TAB: USTAWIENIA ---------- */
 const settingsToForm = s => ({
   carName: s.carName,
@@ -2747,7 +3469,8 @@ function SectionTitle({
 function UstawieniaTab({
   data,
   setData,
-  notify
+  notify,
+  sync
 }) {
   const [f, setF] = useState(() => settingsToForm(data.settings));
   const [errors, setErrors] = useState({});
@@ -2845,6 +3568,7 @@ function UstawieniaTab({
         gap: 10
       }}
     >
+      <SyncCard sync={sync} />
       <Card>
         <SectionTitle>Pojazd</SectionTitle>
         {field("carName", "Nazwa auta", null, "text")}
@@ -2957,7 +3681,7 @@ function UstawieniaTab({
       {pendingImport && (
         <ConfirmSheet
           title="Wczytać kopię?"
-          message={`Obecne dane zostaną zastąpione zawartością pliku ${pendingImport.name} (${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}, ${plural(pendingImport.data.serwisy.length, "serwis", "serwisy", "serwisów")}, ${plural(pendingImport.data.koszty.length, "koszt", "koszty", "kosztów")}).`}
+          message={`Obecne dane zostaną zastąpione zawartością pliku ${pendingImport.name} (${plural(pendingImport.data.tankowania.length, "tankowanie", "tankowania", "tankowań")}, ${plural(pendingImport.data.serwisy.length, "serwis", "serwisy", "serwisów")}, ${plural(pendingImport.data.koszty.length, "koszt", "koszty", "kosztów")}).${sync.connected ? " Zmiana trafi też do arkusza Google." : ""}`}
           confirmText="Wczytaj"
           danger={false}
           onCancel={() => setPendingImport(null)}
@@ -3001,7 +3725,8 @@ function CarDashboardApp() {
     data,
     setData,
     loading,
-    error
+    error,
+    sync
   } = useCarData();
   const [tab, setTab] = useState("dashboard");
   const [toast, setToast] = useState(null);
@@ -3084,6 +3809,7 @@ function CarDashboardApp() {
                 {settings.carSubtitle || "DZIENNIK POKŁADOWY"}
               </div>
             </div>
+            <SyncBadge sync={sync} />
           </div>
         </header>
         <main
@@ -3124,7 +3850,7 @@ function CarDashboardApp() {
               {tab === "serwisy" && <SerwisyTab data={data} setData={setData} notify={notify} />}
               {tab === "koszty" && <KosztyTab data={data} setData={setData} notify={notify} />}
               {tab === "prognoza" && <PrognozaTab agg={agg} settings={data.settings} />}
-              {tab === "ustawienia" && <UstawieniaTab data={data} setData={setData} notify={notify} />}
+              {tab === "ustawienia" && <UstawieniaTab data={data} setData={setData} notify={notify} sync={sync} />}
             </>
           )}
         </main>

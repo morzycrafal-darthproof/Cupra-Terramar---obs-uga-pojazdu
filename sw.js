@@ -1,4 +1,4 @@
-const CACHE = "cupra-terramar-v8";
+const CACHE = "cupra-terramar-v9";
 const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./emblem.png"];
 
 self.addEventListener("install", (e) => {
@@ -16,6 +16,8 @@ self.addEventListener("activate", (e) => {
 });
 
 self.addEventListener("fetch", (e) => {
+  // Google sign-in / Sheets API and other hosts: straight to the network, never cached
+  if (new URL(e.request.url).origin !== self.location.origin) return;
   const isHTML =
     e.request.mode === "navigate" ||
     (e.request.method === "GET" && (e.request.headers.get("accept") || "").includes("text/html"));
