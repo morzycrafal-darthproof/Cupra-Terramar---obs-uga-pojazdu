@@ -1211,8 +1211,13 @@ function useCarData() {
       tankowania: recalcTankowania(sane.tankowania)
     };
     const ops = diffOps(dataRef.current, clean);
+    // numbered, so a sync knows which operations it sent even after compaction reorders the queue
     if (ops.length) updateMeta(m => ({
-      ops: compactOps([...m.ops, ...ops])
+      ops: compactOps([...m.ops, ...ops.map((op, i) => ({
+        ...op,
+        seq: (m.seq || 0) + i + 1
+      }))]),
+      seq: (m.seq || 0) + ops.length
     }));
     adopt(clean);
   }, []);
@@ -1234,10 +1239,11 @@ function useCarData() {
       message: null
     });
     const sentOps = m.ops;
+    const maxSent = Math.max(0, ...sentOps.map(op => op.seq || 0));
     try {
       const res = await syncWithSheet(dataRef.current, sentOps, !m.firstDone, token);
       // edits made while the request was running stay queued and are applied on top
-      const later = metaRef.current.ops.slice(sentOps.length);
+      const later = metaRef.current.ops.filter(op => (op.seq || 0) > maxSent);
       adopt(later.length ? applyOps(res.data, later) : res.data);
       updateMeta({
         ops: later,

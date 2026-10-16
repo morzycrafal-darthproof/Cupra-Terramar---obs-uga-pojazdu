@@ -24,6 +24,15 @@ Dane zapisują się automatycznie w pliku:
 Kopię zapasową możesz zrobić w zakładce Ustawienia -> "Eksportuj kopię".
 Plik kopii ma ten sam format co w aplikacji na telefon (PWA).
 
+SYNCHRONIZACJA Z ARKUSZEM GOOGLE
+--------------------------------
+Ustawienia -> "Arkusz Google" -> "Połącz z Google". Wspólne dane z aplikacją na telefon są w arkuszu
+„Cupra Terramar - dane”. Potrzebne pliki w C:\Users\<Ty>\.cupra_terramar\ (nigdy w repozytorium):
+   client_secret.json   klient OAuth typu „Aplikacja komputerowa” z Google Cloud
+   google_token.json    zapisywany po pierwszym zalogowaniu
+   sync.json            kolejka zmian czekających na wysłanie
+Zmiany wysyłają się same chwilę po zapisie, przy starcie programu i co 10 minut; bez internetu czekają w kolejce.
+
 FUNKCJE
 -------
 - Pulpit: wskaźnik średniego spalania, kafelki KPI, wykresy kosztów i spalania

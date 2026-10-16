@@ -19,7 +19,11 @@ Wymagania:
 import json
 import math
 import os
+import queue
+import threading
+import time
 import uuid
+import webbrowser
 import datetime as dt
 import tkinter as tk
 import tkinter.font as tkfont
@@ -1739,9 +1743,10 @@ class UstawieniaPage(Page):
         grid.pack(fill="x", padx=(0, 12))
         grid.columnconfigure((0, 1), weight=1, uniform="s")
 
-        def section(r, c, title, desc, ic):
+        def section(r, c, title, desc, ic, span=1):
             box = card(grid)
-            box.grid(row=r, column=c, sticky="nsew", padx=(0 if c == 0 else 6, 6 if c == 0 else 0), pady=(0, 12))
+            box.grid(row=r, column=c, columnspan=span, sticky="nsew",
+                     padx=(0 if c == 0 else 6, 0 if c + span == 2 else 6), pady=(0, 12))
             top = ctk.CTkFrame(box, fg_color="transparent")
             top.pack(fill="x", padx=20, pady=(18, 12))
             ctk.CTkLabel(top, text="", width=32, height=32, corner_radius=9, fg_color=C["copper_soft"],
@@ -1779,6 +1784,22 @@ class UstawieniaPage(Page):
         ghost_button(row, "Eksportuj kopię", self.app.export_backup, "export").pack(side="left")
         ghost_button(row, "Wczytaj kopię", self.app.import_backup, "import").pack(side="left", padx=(8, 0))
 
+        sy = section(2, 0, "Arkusz Google", "wspólne dane z aplikacją na telefon — „Cupra Terramar - dane”",
+                     "export", span=2)
+        info = ctk.CTkFrame(sy, fg_color="transparent")
+        info.pack(fill="x")
+        self.sync_vals = {}
+        for i, (key, title) in enumerate((("state", "Stan"), ("last", "Ostatnia synchronizacja"),
+                                          ("pending", "Zmiany do wysłania"))):
+            cell = ctk.CTkFrame(info, fg_color="transparent")
+            cell.grid(row=0, column=i, sticky="w", padx=(0, 40))
+            label(cell, title, 11, C["text_faint"]).pack(anchor="w")
+            self.sync_vals[key] = label(cell, "—", 14, weight="semibold")
+            self.sync_vals[key].pack(anchor="w")
+        self.sync_msg = label(sy, "", 12, C["amber"], wraplength=760, justify="left", anchor="w")
+        self.sync_buttons = ctk.CTkFrame(sy, fg_color="transparent")
+        self.sync_buttons.pack(fill="x", pady=(12, 12))
+
     def refresh(self):
         s = self.app.data["settings"]
         for f, v in ((self.f_name, s["carName"]), (self.f_sub, s["carSubtitle"]),
@@ -1787,6 +1808,38 @@ class UstawieniaPage(Page):
                      (self.f_growth, num_in(round(s["fuelPriceGrowth"] * 100, 4)))):
             f.set(v)
             f.set_error(None)
+        self.refresh_sync()
+
+    def refresh_sync(self):
+        app, st = self.app, self.app.sync_state
+        state, msg = app.sync_status
+        self.sync_vals["state"].configure(text=sync_label(app), text_color=sync_color(app))
+        self.sync_vals["last"].configure(text=time.strftime("%d.%m, %H:%M", time.localtime(st["lastSync"]))
+                                         if st.get("lastSync") else "jeszcze nie")
+        self.sync_vals["pending"].configure(text=str(len(st["ops"])))
+        if msg:
+            self.sync_msg.configure(text=msg, text_color=C["red"] if state == "error" else C["amber"])
+            self.sync_msg.pack(anchor="w", pady=(10, 0), before=self.sync_buttons)
+        else:
+            self.sync_msg.pack_forget()
+        for w in self.sync_buttons.winfo_children():
+            w.destroy()
+        if not st["connected"]:
+            label(self.sync_buttons, "Przy pierwszym połączeniu wpisy, których nie ma w arkuszu, zostaną do niego dopisane; "
+                  "te same wpisy są rozpoznawane po treści.", 12, C["text_dim"], wraplength=560,
+                  justify="left").pack(side="left")
+            primary_button(self.sync_buttons, "Połącz z Google", app.sync_connect, "export").pack(side="right")
+            return
+        if state == "auth":
+            primary_button(self.sync_buttons, "Zaloguj do Google", app.sync_connect, "export").pack(side="left")
+        else:
+            primary_button(self.sync_buttons, "Synchronizuj teraz", app.sync_now, "import").pack(side="left")
+        ghost_button(self.sync_buttons, "Otwórz arkusz",
+                     lambda: webbrowser.open(f"https://docs.google.com/spreadsheets/d/{sheet_id()}/edit")
+                     ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(self.sync_buttons, text="Odłącz", width=90, height=38, corner_radius=10, fg_color="transparent",
+                      hover_color=C["surface3"], text_color=C["text_faint"], font=font(13),
+                      command=app.sync_disconnect).pack(side="right")
 
     def save(self):
         chk = EntryForm.check
@@ -1813,8 +1866,395 @@ class UstawieniaPage(Page):
 
 
 # ----------------------------------------------------------------------
+# GOOGLE SHEETS SYNC (same rules as the web app)
+# ----------------------------------------------------------------------
+# The Google Sheet is the shared source of truth. Local changes are queued as numbered operations; a sync
+# pulls the sheet, applies the queue on top, recomputes distances, writes back only the tabs that changed
+# and adopts the result. Network work runs in a background thread; results reach Tk through a queue.
+GOOGLE_SHEET_ID = "1qIYl3xkVN4EK62Zd_z_w_QyJvh-HVQv5-0ZD4WCvWgw"
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+CLIENT_SECRET_FILE = os.path.join(DATA_DIR, "client_secret.json")
+TOKEN_FILE = os.path.join(DATA_DIR, "google_token.json")
+SYNC_FILE = os.path.join(DATA_DIR, "sync.json")
+COLLECTIONS = ("tankowania", "serwisy", "koszty")
+SETTING_KEYS = ("carName", "carSubtitle", "consumptionOkTo", "consumptionHighFrom", "fuelPriceGrowth",
+                "monthlyKmPlan", "carPrice")
+
+
+def sheet_id():
+    return os.environ.get("CUPRA_SHEET_ID") or GOOGLE_SHEET_ID  # override for tests on a copy
+
+
+class SyncAuthError(Exception):
+    pass
+
+
+class SyncDataError(Exception):
+    pass
+
+
+def load_sync_state():
+    try:
+        with open(SYNC_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    return {"connected": bool(state.get("connected")), "firstDone": bool(state.get("firstDone")),
+            "ops": state.get("ops") or [], "seq": int(state.get("seq") or 0), "lastSync": state.get("lastSync")}
+
+
+def save_sync_state(state):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = SYNC_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, SYNC_FILE)
+
+
+# --- auth (google-auth-oauthlib, imported lazily so the app runs without it) ---
+def google_credentials(interactive=False):
+    """Stored credentials, refreshed if needed; with interactive=True the browser sign-in is started."""
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+    except ImportError:
+        raise SyncAuthError("Brak biblioteki google-auth-oauthlib (py -m pip install -r requirements.txt).")
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, GOOGLE_SCOPES)
+        except Exception:
+            creds = None
+    if creds and not creds.valid and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception:
+            creds = None
+    if creds and creds.valid:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+        return creds
+    if not interactive:
+        raise SyncAuthError("Zaloguj się do Google, żeby zsynchronizować dane.")
+    if not os.path.exists(CLIENT_SECRET_FILE):
+        raise SyncAuthError(f"Brak pliku {CLIENT_SECRET_FILE} (klient OAuth „Cupra desktop”).")
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, GOOGLE_SCOPES)
+    creds = flow.run_local_server(port=0, open_browser=True, timeout_seconds=300,
+                                  success_message="Gotowe — możesz zamknąć tę kartę i wrócić do aplikacji.")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+    return creds
+
+
+class SheetsClient:
+    def __init__(self, creds):
+        from google.auth.transport.requests import AuthorizedSession
+        self.session = AuthorizedSession(creds)
+        self.base = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id()}"
+
+    def _call(self, method, path, **kw):
+        r = self.session.request(method, self.base + path, timeout=30, **kw)
+        if r.status_code == 401:
+            raise SyncAuthError("Sesja Google wygasła — zaloguj się ponownie.")
+        if not r.ok:
+            try:
+                msg = r.json()["error"]["message"]
+            except Exception:
+                msg = r.text[:200]
+            raise SyncDataError(f"Błąd Google Sheets ({r.status_code}): {msg}")
+        return r.json()
+
+    def batch_get(self, ranges):
+        params = [("ranges", x) for x in ranges] + [("valueRenderOption", "UNFORMATTED_VALUE"),
+                                                    ("dateTimeRenderOption", "SERIAL_NUMBER")]
+        return self._call("GET", "/values:batchGet", params=params)["valueRanges"]
+
+    def batch_clear(self, ranges):
+        self._call("POST", "/values:batchClear", json={"ranges": ranges})
+
+    def batch_update(self, data):
+        self._call("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": data})
+
+
+# --- sheet <-> app rows ---
+SERIAL_EPOCH = dt.date(1899, 12, 30)
+
+
+def iso_to_serial(iso):
+    return (dt.date.fromisoformat(iso) - SERIAL_EPOCH).days
+
+
+def cell_date(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        return (SERIAL_EPOCH + dt.timedelta(days=round(v))).isoformat()
+    s = cell_text(v)
+    try:
+        return parse_date(s) if s else None
+    except ValueError:
+        return None
+
+
+def cell_number(v, optional=False):
+    """Number from a cell; None if empty and optional; NaN if unreadable."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
+    if cell_text(v) == "":
+        return None if optional else float("nan")
+    try:
+        return parse_number(str(v))
+    except ValueError:
+        return float("nan")
+
+
+def cell_text(v):
+    return "" if v is None else str(v).strip()
+
+
+def is_nan(v):
+    return isinstance(v, float) and math.isnan(v)
+
+
+def yes(v):
+    return cell_text(v).lower() in ("tak", "t", "yes", "true", "1")
+
+
+def _num_or_blank(v):
+    return "" if v is None else v
+
+
+def _tank_from(r):
+    e = {"id": cell_text(r[0]), "date": cell_date(r[1]), "fuelType": cell_text(r[2]) or "Pb98",
+         "liters": cell_number(r[3]), "cost": cell_number(r[4]), "mileage": cell_number(r[6]),
+         "note": cell_text(r[9])}
+    if not e["date"] or is_nan(e["liters"]) or not e["liters"] > 0 or is_nan(e["cost"]) or is_nan(e["mileage"]):
+        return None
+    if isinstance(e["mileage"], float) and e["mileage"].is_integer():
+        e["mileage"] = int(e["mileage"])
+    # as stored in the sheet; recalc_tankowania / with_prices bring them in line afterwards
+    e.update(pricePerL=cell_number(r[5], True), distance=cell_number(r[7], True), consumption=cell_number(r[8], True))
+    return e
+
+
+def _serw_from(r):
+    price = cell_number(r[4], True)
+    price = 0 if price is None else price
+    warranty = yes(r[5])
+    mileage = cell_number(r[2], True)
+    e = {"id": cell_text(r[0]), "date": cell_date(r[1]), "mileage": mileage, "description": cell_text(r[3]),
+         "price": price, "warranty": warranty, "paidCost": 0 if warranty else price, "note": cell_text(r[7])}
+    if not e["date"] or not e["description"] or is_nan(price) or is_nan(mileage):
+        return None
+    return e
+
+
+def _koszt_from(r):
+    typ = cell_text(r[2]) or "Inne"
+    e = {"id": cell_text(r[0]), "date": cell_date(r[1]), "type": typ, "description": cell_text(r[3]) or typ,
+         "amount": cell_number(r[4]), "oneTime": yes(r[5]) if cell_text(r[5]) else True, "note": cell_text(r[6])}
+    if not e["date"] or is_nan(e["amount"]):
+        return None
+    return e
+
+
+SHEET_TABLES = [
+    {"coll": "tankowania", "tab": "Tankowania", "last": "J", "width": 10,
+     "key": lambda t: (t["date"], t["mileage"]),
+     "to_row": lambda t: [t["id"], iso_to_serial(t["date"]), t["fuelType"], t["liters"], t["cost"], t["pricePerL"],
+                          t["mileage"], _num_or_blank(t.get("distance")), _num_or_blank(t.get("consumption")),
+                          t.get("note") or ""],
+     "from_row": _tank_from},
+    {"coll": "serwisy", "tab": "Serwisy", "last": "H", "width": 8,
+     "key": lambda s: s["date"],
+     "to_row": lambda s: [s["id"], iso_to_serial(s["date"]), _num_or_blank(s.get("mileage")), s["description"],
+                          s["price"], "TAK" if s["warranty"] else "NIE", s["paidCost"], s.get("note") or ""],
+     "from_row": _serw_from},
+    {"coll": "koszty", "tab": "Koszty", "last": "G", "width": 7,
+     "key": lambda k: k["date"],
+     "to_row": lambda k: [k["id"], iso_to_serial(k["date"]), k["type"], k["description"], k["amount"],
+                          "NIE" if k.get("oneTime") is False else "TAK", k.get("note") or ""],
+     "from_row": _koszt_from},
+]
+
+# the same real event recorded on two devices (different IDs)
+SAME_EVENT = {
+    "tankowania": lambda a, b: a["mileage"] == b["mileage"],
+    "serwisy": lambda a, b: a["date"] == b["date"] and (
+        a["description"] == b["description"] or bool(a.get("mileage")) and a.get("mileage") == b.get("mileage")),
+    "koszty": lambda a, b: a["date"] == b["date"] and a["type"] == b["type"] and a["amount"] == b["amount"],
+}
+
+
+def pull_sheet(client):
+    ranges = [f"{t['tab']}!A2:{t['last']}" for t in SHEET_TABLES] + ["Ustawienia!A2:B"]
+    res = client.batch_get(ranges)
+    out = {"data": {"settings": {}}, "rows": {}, "needs_rewrite": set(), "invalid": [], "setting_rows": {}}
+    for t, vr in zip(SHEET_TABLES, res):
+        rows = vr.get("values", [])
+        out["rows"][t["tab"]] = len(rows)
+        out["data"][t["coll"]] = []
+        for j, r in enumerate(rows):
+            r = list(r) + [""] * (t["width"] - len(r))
+            if not any(cell_text(c) for c in r):
+                continue
+            e = t["from_row"](r)
+            if e is None:
+                out["invalid"].append(f"{t['tab']}, wiersz {j + 2}")
+                continue
+            if not e["id"]:
+                e["id"] = new_id()  # typed by hand in the sheet: give it an ID and write it back
+                out["needs_rewrite"].add(t["tab"])
+            out["data"][t["coll"]].append(e)
+    for j, r in enumerate(res[len(SHEET_TABLES)].get("values", [])):
+        key = cell_text(r[0]) if r else ""
+        if key not in SETTING_KEYS:
+            continue
+        out["setting_rows"][key] = j + 2
+        v = r[1] if len(r) > 1 else ""
+        out["data"]["settings"][key] = cell_text(v) if key in ("carName", "carSubtitle") else cell_number(v)
+    return out
+
+
+def diff_ops(prev, nxt):
+    ops = []
+    for coll in COLLECTIONS:
+        before = {e["id"]: e for e in prev.get(coll, [])}
+        after = {e["id"]: e for e in nxt[coll]}
+        for eid, e in after.items():
+            if before.get(eid) != e:
+                ops.append({"type": "upsert", "coll": coll, "entry": json.loads(json.dumps(e))})
+        for eid in before:
+            if eid not in after:
+                ops.append({"type": "delete", "coll": coll, "id": eid})
+    if prev.get("settings") != nxt["settings"]:
+        ops.append({"type": "settings", "settings": dict(nxt["settings"])})
+    return ops
+
+
+def op_key(op):
+    if op["type"] == "settings":
+        return "settings"
+    return f"{op['coll']}:{op['id'] if op['type'] == 'delete' else op['entry']['id']}"
+
+
+def compact_ops(ops):
+    """Only the latest operation per entry matters."""
+    last = {}
+    for op in ops:
+        last.pop(op_key(op), None)
+        last[op_key(op)] = op
+    return list(last.values())
+
+
+def apply_ops(data, ops):
+    d = {c: [dict(e) for e in data[c]] for c in COLLECTIONS}
+    d["settings"] = dict(data["settings"])
+    for op in ops:
+        if op["type"] == "settings":
+            d["settings"].update(op["settings"])
+        elif op["type"] == "delete":
+            d[op["coll"]] = [e for e in d[op["coll"]] if e["id"] != op["id"]]
+        else:
+            items = d[op["coll"]]
+            idx = next((i for i, e in enumerate(items) if e["id"] == op["entry"]["id"]), None)
+            if idx is None:
+                items.append(dict(op["entry"]))
+            else:
+                items[idx] = dict(op["entry"])
+    recalc_tankowania(d["tankowania"])
+    return d
+
+
+def with_prices(tankowania):
+    for t in tankowania:
+        t["pricePerL"] = round(t["cost"] / t["liters"], 3)
+
+
+def sync_with_sheet(client, local, ops, first_connect):
+    remote = pull_sheet(client)
+    if remote["invalid"]:
+        more = "…" if len(remote["invalid"]) > 3 else ""
+        raise SyncDataError(f"W arkuszu są wiersze, których nie da się odczytać ({'; '.join(remote['invalid'][:3])}{more}). "
+                            "Popraw je — do tego czasu nic nie zostanie nadpisane.")
+    good_settings = {k: v for k, v in remote["data"]["settings"].items()
+                     if v not in ("", None) and not is_nan(v)}
+    base = sanitize({**remote["data"], "settings": {**local["settings"], **good_settings}})
+    pending = ops
+    if first_connect:
+        # first connection: keep entries that exist only on this device (matched by ID or content);
+        # the sheet wins for everything else
+        def in_sheet(coll, e):
+            return any(r["id"] == e["id"] or SAME_EVENT[coll](r, e) for r in base[coll])
+
+        extra = [{"type": "upsert", "coll": c, "entry": e} for c in COLLECTIONS for e in local[c]
+                 if not in_sheet(c, e)]
+
+        def known(op):
+            return (op["type"] == "upsert" and not any(r["id"] == op["entry"]["id"] for r in base[op["coll"]])
+                    and in_sheet(op["coll"], op["entry"]))
+
+        pending = extra + [op for op in ops if op["type"] != "settings" and not known(op)]
+    merged = apply_ops(base, pending)
+    with_prices(merged["tankowania"])
+
+    clears, data = [], []
+    for t in SHEET_TABLES:
+        rows = [t["to_row"](e) for e in sorted(merged[t["coll"]], key=t["key"])]
+        current = [t["to_row"](e) for e in remote["data"][t["coll"]]]
+        gaps = remote["rows"][t["tab"]] != len(remote["data"][t["coll"]])
+        if t["tab"] not in remote["needs_rewrite"] and not gaps and rows == current:
+            continue
+        if rows:
+            data.append({"range": f"{t['tab']}!A2", "values": rows})
+        if remote["rows"][t["tab"]] > len(rows):
+            clears.append(f"{t['tab']}!A{len(rows) + 2}:{t['last']}{remote['rows'][t['tab']] + 1}")
+    next_row = max([1, *remote["setting_rows"].values()]) + 1
+    for k in SETTING_KEYS:
+        if merged["settings"].get(k) == remote["data"]["settings"].get(k):
+            continue
+        row = remote["setting_rows"].get(k)
+        if row is None:
+            row, next_row = next_row, next_row + 1
+        data.append({"range": f"Ustawienia!A{row}:B{row}", "values": [[k, merged["settings"][k]]]})
+    if clears:
+        client.batch_clear(clears)
+    if data:
+        client.batch_update(data)
+    return merged
+
+
+# ----------------------------------------------------------------------
 # MAIN APPLICATION
 # ----------------------------------------------------------------------
+SYNC_LONG = {"syncing": "Synchronizacja…", "auth": "Zaloguj do Google", "error": "Błąd synchronizacji"}
+
+
+def sync_label(app):
+    state, _ = app.sync_status
+    pending = len(app.sync_state["ops"])
+    if not app.sync_state["connected"]:
+        return "Niepołączono"
+    if state in SYNC_LONG:
+        return SYNC_LONG[state]
+    if pending:
+        return f"Do wysłania: {pending}"
+    return "Zsynchronizowano" if app.sync_state.get("lastSync") else "Połączono"
+
+
+def sync_color(app):
+    state, _ = app.sync_status
+    if not app.sync_state["connected"]:
+        return C["text_faint"]
+    if state == "error":
+        return C["red"]
+    if state == "auth":
+        return C["amber"]
+    if state == "ok" and not app.sync_state["ops"]:
+        return C["green"]
+    return C["text_dim"]
+
+
 class CarApp(ctk.CTk):
     PAGES = [("dashboard", "Pulpit", "home", DashboardPage), ("tankowania", "Tankowania", "fuel", TankowaniaPage),
              ("serwisy", "Serwisy", "wrench", SerwisyPage), ("koszty", "Koszty", "card", KosztyPage),
@@ -1826,6 +2266,13 @@ class CarApp(ctk.CTk):
         super().__init__(fg_color=C["bg"])
         self.withdraw()  # shown at the end of __init__, fully built and with the dark title bar
         self.data = load_data()
+        self.sync_state = load_sync_state()
+        self.sync_status = ("idle", None)
+        self._snapshot = json.loads(json.dumps(self.data))
+        self._sync_thread = None
+        self._sync_job = None
+        self._sync_again = False
+        self._sync_results = queue.Queue()
         self.title("Cupra Terramar — Dziennik pokładowy")
         scale = ctk.ScalingTracker.get_window_scaling(self)
         w = min(1280, int(self.winfo_screenwidth() / scale * 0.92))
@@ -1858,6 +2305,11 @@ class CarApp(ctk.CTk):
         self.show("dashboard")
         style_titlebar(self, C["bg"])
         self.deiconify()
+        self._refresh_sync_badge()
+        self.after(200, self._poll_sync)
+        if self.sync_state["connected"]:
+            self.after(800, self.sync_now)
+        self.after(10 * 60 * 1000, self._periodic_sync)
 
     # ---------------- layout ----------------
     def _build_sidebar(self):
@@ -1895,6 +2347,10 @@ class CarApp(ctk.CTk):
         if wm:
             ctk.CTkLabel(foot, text="", image=wm).pack(anchor="w")
         label(foot, "Ctrl+N — nowy wpis", 11, C["text_faint"]).pack(anchor="w", pady=(8, 0))
+        self.sync_badge = ctk.CTkButton(sb, text="", anchor="w", height=30, corner_radius=8, font=font(12),
+                                        fg_color="transparent", hover_color=C["surface2"],
+                                        command=self._sync_badge_click)
+        self.sync_badge.pack(side="bottom", fill="x", padx=14, pady=(0, 4))
 
     def _refresh_brand(self):
         self.brand_title.configure(text=self.data["settings"]["carName"].title()
@@ -1930,17 +2386,143 @@ class CarApp(ctk.CTk):
     def data_changed(self):
         recalc_tankowania(self.data["tankowania"])
         save_data(self.data)
+        self._record_ops()
+        self._refresh_views()
+
+    def _refresh_views(self):
         self._refresh_brand()
+        self._refresh_sync_badge()
         self.dirty = set(self.pages)
         self.show(self.current)
 
     def upsert(self, collection, entry, values):
-        target = entry if entry is not None else {"id": new_id()}
-        target.update(values)
-        if entry is None:
+        target = None
+        if entry is not None:
+            # a sync may have replaced the data since the form was opened: write into the current copy
+            target = next((e for e in self.data[collection] if e["id"] == entry["id"]), None)
+        if target is None:
+            target = {"id": entry["id"] if entry is not None else new_id()}
             self.data[collection].append(target)
+        target.update(values)
         self.data_changed()
         return target
+
+    # ---------------- Google Sheets sync ----------------
+    def _record_ops(self):
+        ops = diff_ops(self._snapshot, self.data)
+        if ops:
+            for op in ops:
+                self.sync_state["seq"] += 1
+                op["seq"] = self.sync_state["seq"]
+            self.sync_state["ops"] = compact_ops(self.sync_state["ops"] + ops)
+            save_sync_state(self.sync_state)
+            self._schedule_sync(1500)
+        self._snapshot = json.loads(json.dumps(self.data))
+
+    def _schedule_sync(self, ms):
+        if not self.sync_state["connected"]:
+            return
+        if self._sync_job:
+            self.after_cancel(self._sync_job)
+        self._sync_job = self.after(ms, self.sync_now)
+
+    def _periodic_sync(self):
+        if self.sync_state["connected"]:
+            self.sync_now()
+        self.after(10 * 60 * 1000, self._periodic_sync)
+
+    def sync_now(self, interactive=False):
+        self._sync_job = None
+        if not self.sync_state["connected"]:
+            return
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            self._sync_again = True
+            return
+        local = json.loads(json.dumps(self.data))
+        ops = json.loads(json.dumps(self.sync_state["ops"]))
+        first = not self.sync_state["firstDone"]
+        max_seq = max((op.get("seq", 0) for op in ops), default=0)
+        results = self._sync_results
+
+        def work():
+            try:
+                creds = google_credentials(interactive)
+                results.put(("ok", sync_with_sheet(SheetsClient(creds), local, ops, first), max_seq))
+            except SyncAuthError as exc:
+                results.put(("auth", str(exc), max_seq))
+            except SyncDataError as exc:
+                results.put(("error", str(exc), max_seq))
+            except Exception as exc:  # network down, timeouts...
+                results.put(("error", f"Synchronizacja nie powiodła się ({exc.__class__.__name__}). "
+                                      "Zmiany czekają w kolejce.", max_seq))
+
+        self._set_sync_status("syncing")
+        self._sync_thread = threading.Thread(target=work, daemon=True)
+        self._sync_thread.start()
+
+    def _poll_sync(self):
+        try:
+            while True:
+                self._finish_sync(*self._sync_results.get_nowait())
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(200, self._poll_sync)
+
+    def _finish_sync(self, kind, payload, max_seq):
+        if kind == "ok":
+            # edits made while the request was running stay queued and are applied on top
+            later = [op for op in self.sync_state["ops"] if op.get("seq", 0) > max_seq]
+            self.data = sanitize(apply_ops(payload, later) if later else payload)
+            recalc_tankowania(self.data["tankowania"])
+            save_data(self.data)
+            self._snapshot = json.loads(json.dumps(self.data))
+            self.sync_state.update(ops=later, firstDone=True, lastSync=time.time())
+            save_sync_state(self.sync_state)
+            self.sync_status = ("ok", None)
+            self._refresh_views()
+            if later:
+                self._schedule_sync(500)
+        else:
+            self._set_sync_status(kind, payload)
+        if self._sync_again:
+            self._sync_again = False
+            self._schedule_sync(300)
+
+    def _set_sync_status(self, state, message=None):
+        self.sync_status = (state, message)
+        self._refresh_sync_badge()
+        if "ustawienia" not in self.dirty:
+            self.pages["ustawienia"].refresh_sync()
+
+    def _refresh_sync_badge(self):
+        self.sync_badge.configure(text=f"●  {sync_label(self)}", text_color=sync_color(self))
+
+    def _sync_badge_click(self):
+        if not self.sync_state["connected"]:
+            self.show("ustawienia")
+        elif self.sync_status[0] == "auth":
+            self.sync_connect()
+        else:
+            self.sync_now()
+
+    def sync_connect(self):
+        self.sync_state["connected"] = True
+        save_sync_state(self.sync_state)
+        self.toast.show("Otwieram logowanie Google w przeglądarce…")
+        self.sync_now(interactive=True)
+
+    def sync_disconnect(self):
+        def do():
+            self.sync_state.update(connected=False, firstDone=False)
+            save_sync_state(self.sync_state)
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+            self._set_sync_status("idle")
+            self.toast.show("Odłączono od arkusza Google", "warn")
+
+        ConfirmDialog(self, "Odłączyć arkusz?", "Dane zostaną na komputerze, ale zmiany przestaną trafiać do arkusza "
+                      "Google. Możesz połączyć się ponownie w każdej chwili.", "Odłącz", do)
 
     def delete_entry(self, collection, entry):
         self.data[collection] = [e for e in self.data[collection] if e["id"] != entry["id"]]
@@ -1992,7 +2574,8 @@ class CarApp(ctk.CTk):
                       f"Obecne dane zostaną zastąpione zawartością pliku {os.path.basename(path)} "
                       f"({plural(len(new['tankowania']), 'tankowanie', 'tankowania', 'tankowań')}, "
                       f"{plural(len(new['serwisy']), 'serwis', 'serwisy', 'serwisów')}, "
-                      f"{plural(len(new['koszty']), 'koszt', 'koszty', 'kosztów')}).",
+                      f"{plural(len(new['koszty']), 'koszt', 'koszty', 'kosztów')})."
+                      + (" Zmiana trafi też do arkusza Google." if self.sync_state["connected"] else ""),
                       "Wczytaj", apply, danger=False)
 
 
