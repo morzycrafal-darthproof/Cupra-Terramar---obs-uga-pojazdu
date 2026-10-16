@@ -1,4 +1,4 @@
-const CACHE = "cupra-terramar-v12";
+const CACHE = "cupra-terramar-v13";
 const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./emblem.png",
   "./apple-touch-icon.png", "./favicon-16.png", "./favicon-32.png"];
 

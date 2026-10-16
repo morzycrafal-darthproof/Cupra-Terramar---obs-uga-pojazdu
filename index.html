@@ -998,16 +998,33 @@ async function pullSheet(token) {
 
 /* --- operations queue --- */
 const sameEntry = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+// recomputed from the other fields, so they never decide what a change overwrites
+const DERIVED = ["distance", "consumption", "pricePerL", "paidCost"];
+const changedFields = (a, b) => Object.keys({
+  ...a,
+  ...b
+}).filter(k => !DERIVED.includes(k) && !sameEntry(a[k] ?? "", b[k] ?? ""));
+
+// an edit records only the fields that changed: applied to the sheet's current version of the entry,
+// it cannot undo a change made to another field on another device in the meantime
 function diffOps(prev, next) {
   const ops = [];
   COLLECTIONS.forEach(coll => {
     const before = new Map((prev?.[coll] || []).map(e => [e.id, e]));
     const after = new Map(next[coll].map(e => [e.id, e]));
     after.forEach((e, id) => {
-      if (!sameEntry(before.get(id), e)) ops.push({
+      const b = before.get(id);
+      if (!b) return ops.push({
         type: "upsert",
         coll,
         entry: e
+      });
+      const fields = changedFields(b, e);
+      if (fields.length) ops.push({
+        type: "upsert",
+        coll,
+        entry: e,
+        fields
       });
     });
     before.forEach((e, id) => {
@@ -1018,19 +1035,34 @@ function diffOps(prev, next) {
       });
     });
   });
-  if (prev && !sameEntry(prev.settings, next.settings)) ops.push({
+  const keys = prev ? Object.keys(next.settings).filter(k => !sameEntry(prev.settings?.[k], next.settings[k])) : [];
+  if (keys.length) ops.push({
     type: "settings",
-    settings: next.settings
+    settings: Object.fromEntries(keys.map(k => [k, next.settings[k]]))
   });
   return ops;
 }
 const opKey = op => op.type === "settings" ? "settings" : `${op.coll}:${op.type === "delete" ? op.id : op.entry.id}`;
-// only the latest operation per entry matters
+// one operation per entry: the latest wins, edits of the same entry merge their field lists
 const compactOps = ops => {
   const last = new Map();
   ops.forEach(op => {
-    last.delete(opKey(op));
-    last.set(opKey(op), op);
+    const key = opKey(op);
+    const prev = last.get(key);
+    let merged = op;
+    if (prev?.type === "upsert" && op.type === "upsert") merged = {
+      ...op,
+      fields: prev.fields && op.fields ? [...new Set([...prev.fields, ...op.fields])] : undefined
+    };
+    if (prev?.type === "settings" && op.type === "settings") merged = {
+      ...op,
+      settings: {
+        ...prev.settings,
+        ...op.settings
+      }
+    };
+    last.delete(key);
+    last.set(key, merged);
   });
   return [...last.values()];
 };
@@ -1050,8 +1082,18 @@ function applyOps(data, ops) {
       ...op.settings
     };else if (op.type === "delete") d[op.coll] = d[op.coll].filter(e => e.id !== op.id);else {
       const i = d[op.coll].findIndex(e => e.id === op.entry.id);
-      if (i >= 0) d[op.coll][i] = op.entry;else d[op.coll].push(op.entry);
+      if (i < 0) d[op.coll].push(op.entry);else if (op.fields) d[op.coll][i] = {
+        ...d[op.coll][i],
+        ...Object.fromEntries(op.fields.map(k => [k, op.entry[k]]))
+      };else d[op.coll][i] = op.entry;
     }
+  });
+  d.serwisy = d.serwisy.map(s => {
+    const paid = s.warranty ? 0 : s.price;
+    return s.paidCost === paid ? s : {
+      ...s,
+      paidCost: paid
+    };
   });
   d.tankowania = recalcTankowania(d.tankowania);
   return d;
@@ -1211,7 +1253,8 @@ function useCarData() {
       ...sane,
       tankowania: recalcTankowania(sane.tankowania)
     };
-    const ops = diffOps(dataRef.current, clean);
+    // nothing is queued while not connected: the first sync merges the data by content instead
+    const ops = metaRef.current.connected ? diffOps(dataRef.current, clean) : [];
     // numbered, so a sync knows which operations it sent even after compaction reorders the queue
     if (ops.length) updateMeta(m => ({
       ops: compactOps([...m.ops, ...ops.map((op, i) => ({
@@ -1265,8 +1308,11 @@ function useCarData() {
     }
   }, []);
   const connect = useCallback(() => {
-    updateMeta({
-      connected: true
+    // a fresh connection starts with an empty queue and a content-matching first sync
+    if (!metaRef.current.connected) updateMeta({
+      connected: true,
+      firstDone: false,
+      ops: []
     });
     startGoogleLogin(false);
   }, []);
@@ -2132,16 +2178,29 @@ function recalcTankowania(list) {
   });
   return out;
 }
-const upsertEntry = (data, coll, entry, values) => ({
-  ...data,
-  [coll]: entry ? data[coll].map(x => x.id === entry.id ? {
-    ...x,
-    ...values
-  } : x) : [...data[coll], {
-    id: uid(),
-    ...values
-  }]
-});
+// `entry` is the entry as it was when the form opened; only fields the user changed since then are
+// written onto the current version (which a sync may have updated in the meantime)
+const upsertEntry = (data, coll, entry, values) => {
+  if (!entry) return {
+    ...data,
+    [coll]: [...data[coll], {
+      id: uid(),
+      ...values
+    }]
+  };
+  const changes = Object.fromEntries(Object.entries(values).filter(([k, v]) => !sameEntry(entry[k] ?? "", v ?? "")));
+  const exists = data[coll].some(x => x.id === entry.id);
+  return {
+    ...data,
+    [coll]: exists ? data[coll].map(x => x.id === entry.id ? {
+      ...x,
+      ...changes
+    } : x) : [...data[coll], {
+      ...entry,
+      ...values
+    }]
+  };
+};
 const removeEntry = (data, coll, entry) => ({
   ...data,
   [coll]: data[coll].filter(x => x.id !== entry.id)
@@ -3468,11 +3527,20 @@ function UstawieniaTab({
   notify,
   sync
 }) {
-  const [f, setF] = useState(() => settingsToForm(data.settings));
+  const [initial, setInitial] = useState(() => settingsToForm(data.settings));
+  const [f, setF] = useState(initial);
   const [errors, setErrors] = useState({});
   const [pendingImport, setPendingImport] = useState(null);
   const fileInputRef = React.useRef(null);
-  const dirty = JSON.stringify(f) !== JSON.stringify(settingsToForm(data.settings));
+  const dirty = !sameEntry(f, initial);
+  // a sync brought new settings: show them, unless the user is in the middle of editing
+  useEffect(() => {
+    const now = settingsToForm(data.settings);
+    if (!dirty && !sameEntry(now, initial)) {
+      setF(now);
+      setInitial(now);
+    }
+  }, [data.settings]);
   const set = key => value => {
     setF(prev => ({
       ...prev,
@@ -3505,19 +3573,25 @@ function UstawieniaTab({
     }
     if (!r.ok) return setErrors(r.errors);
     const v = r.values;
+    const all = {
+      carName: f.carName.trim() || "MOJE AUTO",
+      carSubtitle: f.carSubtitle.trim() || "DZIENNIK POKŁADOWY",
+      consumptionOkTo: v.consumptionOkTo,
+      consumptionHighFrom: v.consumptionHighFrom,
+      fuelPriceGrowth: v.fuelPriceGrowth / 100,
+      monthlyKmPlan: v.monthlyKmPlan,
+      carPrice: v.carPrice
+    };
+    // only the fields edited in this form; the rest keep their current (possibly freshly synced) values
+    const edited = Object.keys(all).filter(k => f[k] !== initial[k]);
     setData({
       ...data,
       settings: {
         ...data.settings,
-        carName: f.carName.trim() || "MOJE AUTO",
-        carSubtitle: f.carSubtitle.trim() || "DZIENNIK POKŁADOWY",
-        consumptionOkTo: v.consumptionOkTo,
-        consumptionHighFrom: v.consumptionHighFrom,
-        fuelPriceGrowth: v.fuelPriceGrowth / 100,
-        monthlyKmPlan: v.monthlyKmPlan,
-        carPrice: v.carPrice
+        ...Object.fromEntries(edited.map(k => [k, all[k]]))
       }
     });
+    setInitial(f);
     notify("Ustawienia zapisane");
   };
   const handleExport = async () => {

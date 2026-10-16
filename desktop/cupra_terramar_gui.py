@@ -932,6 +932,8 @@ class EntryForm(Dialog):
 
     def __init__(self, app, entry, title_new, title_edit, icon_name):
         self.entry = entry
+        # the entry as it was when the form opened: saving writes only what the user changed since then
+        self.initial = json.loads(json.dumps(entry)) if entry is not None else None
         super().__init__(app, title_edit if entry else title_new, icon_name)
         self.build()
         if entry is not None:
@@ -959,7 +961,7 @@ class EntryForm(Dialog):
         values = self.collect()
         if values is None:
             return False
-        saved = self.app.upsert(self.collection, self.entry, values)
+        saved = self.app.upsert(self.collection, self.entry, values, initial=self.initial)
         self.close()
         self.app.toast.show(self.saved_message(saved))
         return True
@@ -1800,14 +1802,25 @@ class UstawieniaPage(Page):
         self.sync_buttons = ctk.CTkFrame(sy, fg_color="transparent")
         self.sync_buttons.pack(fill="x", pady=(12, 12))
 
-    def refresh(self):
+    def _fields(self):
+        """(setting key, field, value as shown in the field)"""
         s = self.app.data["settings"]
-        for f, v in ((self.f_name, s["carName"]), (self.f_sub, s["carSubtitle"]),
-                     (self.f_price, num_in(s["carPrice"])), (self.f_ok, num_in(s["consumptionOkTo"])),
-                     (self.f_high, num_in(s["consumptionHighFrom"])), (self.f_km, num_in(s["monthlyKmPlan"])),
-                     (self.f_growth, num_in(round(s["fuelPriceGrowth"] * 100, 4)))):
-            f.set(v)
-            f.set_error(None)
+        return ((("carName", self.f_name, s["carName"]), ("carSubtitle", self.f_sub, s["carSubtitle"]),
+                 ("carPrice", self.f_price, num_in(s["carPrice"])),
+                 ("consumptionOkTo", self.f_ok, num_in(s["consumptionOkTo"])),
+                 ("consumptionHighFrom", self.f_high, num_in(s["consumptionHighFrom"])),
+                 ("monthlyKmPlan", self.f_km, num_in(s["monthlyKmPlan"])),
+                 ("fuelPriceGrowth", self.f_growth, num_in(round(s["fuelPriceGrowth"] * 100, 4)))))
+
+    def refresh(self):
+        # values synced from the sheet replace a field only if the user has not started editing it
+        loaded = getattr(self, "loaded", {})
+        for key, f, v in self._fields():
+            if key not in loaded or f.get() == loaded[key]:
+                f.set(v)
+                f.set_error(None)
+                loaded[key] = v
+        self.loaded = loaded
         self.refresh_sync()
 
     def refresh_sync(self):
@@ -1856,10 +1869,13 @@ class UstawieniaPage(Page):
         if high <= ok_to:
             self.f_high.set_error("Musi być większe niż próg „w normie”")
             return False
-        s = self.app.data["settings"]
-        s.update({"carName": self.f_name.get() or "MOJE AUTO", "carSubtitle": self.f_sub.get() or "DZIENNIK POKŁADOWY",
-                  "carPrice": price, "consumptionOkTo": ok_to, "consumptionHighFrom": high,
-                  "monthlyKmPlan": km, "fuelPriceGrowth": growth / 100})
+        new = {"carName": self.f_name.get() or "MOJE AUTO", "carSubtitle": self.f_sub.get() or "DZIENNIK POKŁADOWY",
+               "carPrice": price, "consumptionOkTo": ok_to, "consumptionHighFrom": high,
+               "monthlyKmPlan": km, "fuelPriceGrowth": growth / 100}
+        # only the fields edited on this page; the rest keep their current (possibly freshly synced) values
+        edited = [key for key, f, _ in self._fields() if f.get() != self.loaded.get(key)]
+        self.app.data["settings"].update({k: new[k] for k in edited})
+        self.loaded = {}  # reload every field from the saved settings
         self.app.data_changed()
         self.app.toast.show("Ustawienia zapisane")
         return True
@@ -2116,19 +2132,39 @@ def pull_sheet(client):
     return out
 
 
+# recomputed from the other fields, so they never decide what a change overwrites
+DERIVED_FIELDS = ("distance", "consumption", "pricePerL", "paidCost")
+
+
+def same_value(a, b):
+    return ("" if a is None else a) == ("" if b is None else b)
+
+
+def changed_fields(a, b):
+    return [k for k in {**a, **b} if k not in DERIVED_FIELDS and not same_value(a.get(k), b.get(k))]
+
+
 def diff_ops(prev, nxt):
+    """An edit records only the fields that changed: applied to the sheet's current version of the entry,
+    it cannot undo a change made to another field on another device in the meantime."""
     ops = []
     for coll in COLLECTIONS:
         before = {e["id"]: e for e in prev.get(coll, [])}
         after = {e["id"]: e for e in nxt[coll]}
         for eid, e in after.items():
-            if before.get(eid) != e:
-                ops.append({"type": "upsert", "coll": coll, "entry": json.loads(json.dumps(e))})
+            entry = json.loads(json.dumps(e))
+            if eid not in before:
+                ops.append({"type": "upsert", "coll": coll, "entry": entry})
+            else:
+                fields = changed_fields(before[eid], e)
+                if fields:
+                    ops.append({"type": "upsert", "coll": coll, "entry": entry, "fields": fields})
         for eid in before:
             if eid not in after:
                 ops.append({"type": "delete", "coll": coll, "id": eid})
-    if prev.get("settings") != nxt["settings"]:
-        ops.append({"type": "settings", "settings": dict(nxt["settings"])})
+    keys = [k for k in nxt["settings"] if not same_value(prev.get("settings", {}).get(k), nxt["settings"][k])]
+    if keys:
+        ops.append({"type": "settings", "settings": {k: nxt["settings"][k] for k in keys}})
     return ops
 
 
@@ -2139,11 +2175,21 @@ def op_key(op):
 
 
 def compact_ops(ops):
-    """Only the latest operation per entry matters."""
+    """One operation per entry: the latest wins, edits of the same entry merge their field lists."""
     last = {}
     for op in ops:
-        last.pop(op_key(op), None)
-        last[op_key(op)] = op
+        key = op_key(op)
+        prev = last.pop(key, None)
+        merged = op
+        if prev and prev["type"] == op["type"] == "upsert":
+            merged = dict(op)
+            if prev.get("fields") is not None and op.get("fields") is not None:
+                merged["fields"] = list(dict.fromkeys(prev["fields"] + op["fields"]))
+            else:
+                merged.pop("fields", None)
+        elif prev and prev["type"] == op["type"] == "settings":
+            merged = {**op, "settings": {**prev["settings"], **op["settings"]}}
+        last[key] = merged
     return list(last.values())
 
 
@@ -2160,8 +2206,12 @@ def apply_ops(data, ops):
             idx = next((i for i, e in enumerate(items) if e["id"] == op["entry"]["id"]), None)
             if idx is None:
                 items.append(dict(op["entry"]))
+            elif op.get("fields") is not None:
+                items[idx].update({k: op["entry"].get(k) for k in op["fields"]})
             else:
                 items[idx] = dict(op["entry"])
+    for s in d["serwisy"]:
+        s["paidCost"] = 0 if s.get("warranty") else s.get("price", 0)
     recalc_tankowania(d["tankowania"])
     return d
 
@@ -2395,13 +2445,16 @@ class CarApp(ctk.CTk):
         self.dirty = set(self.pages)
         self.show(self.current)
 
-    def upsert(self, collection, entry, values):
+    def upsert(self, collection, entry, values, initial=None):
         target = None
         if entry is not None:
-            # a sync may have replaced the data since the form was opened: write into the current copy
+            # a sync may have replaced the data since the form was opened: write into the current copy,
+            # and only the fields the user changed compared with what the form was opened with
             target = next((e for e in self.data[collection] if e["id"] == entry["id"]), None)
+            if target is not None and initial is not None:
+                values = {k: v for k, v in values.items() if not same_value(initial.get(k), v)}
         if target is None:
-            target = {"id": entry["id"] if entry is not None else new_id()}
+            target = {**(initial or {}), "id": entry["id"] if entry is not None else new_id()}
             self.data[collection].append(target)
         target.update(values)
         self.data_changed()
@@ -2409,7 +2462,9 @@ class CarApp(ctk.CTk):
 
     # ---------------- Google Sheets sync ----------------
     def _record_ops(self):
-        ops = diff_ops(self._snapshot, self.data)
+        # nothing is queued while not connected: a stale edit could otherwise overwrite the sheet much later,
+        # on connecting (entries that exist only here are still added then, matched by content)
+        ops = diff_ops(self._snapshot, self.data) if self.sync_state["connected"] else []
         if ops:
             for op in ops:
                 self.sync_state["seq"] += 1
@@ -2507,7 +2562,8 @@ class CarApp(ctk.CTk):
             self.sync_now()
 
     def sync_connect(self):
-        self.sync_state["connected"] = True
+        if not self.sync_state["connected"]:
+            self.sync_state.update(connected=True, firstDone=False, ops=[])
         save_sync_state(self.sync_state)
         self.toast.show("Otwieram logowanie Google w przeglądarce…")
         self.sync_now(interactive=True)
