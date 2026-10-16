@@ -20,6 +20,7 @@ import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -2636,5 +2637,9 @@ class CarApp(ctk.CTk):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        # own taskbar identity: shown with the app icon (not Python's) and pinnable on its own
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CupraTerramar.Dziennik")
     app = CarApp()
     app.mainloop()
