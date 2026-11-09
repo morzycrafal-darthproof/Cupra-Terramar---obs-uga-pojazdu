@@ -155,7 +155,8 @@ DEFAULT_SETTINGS = {
 }
 
 FUEL_TYPES = ["Pb95", "Pb98"]
-KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"]
+# no "Serwis": services are entered in Serwisy only and appear in Koszty from there (counted once)
+KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"]
 
 
 def seed_data():
@@ -850,7 +851,7 @@ class Field:
         if suffix:
             tk.Label(self.entry, text=suffix, fg=C["text_faint"], bg=C["surface2"],
                      font=tk_font(parent, 12)).place(relx=1.0, rely=0.5, x=-12, anchor="e")
-        self.error = tk.Label(self.frame, fg=C["red"], bg=bg, font=tk_font(parent, 11))
+        self.error = tk.Label(self.frame, fg=C["red"], bg=bg, font=tk_font(parent, 11), wraplength=560, justify="left")
         self._has_error = False
         self.entry.bind("<FocusIn>", lambda e: self._border())
         self.entry.bind("<FocusOut>", lambda e: self._border())
@@ -986,6 +987,12 @@ def required(value, message):
     if not value:
         raise ValueError(message)
     return value
+
+
+def same_serwis(data, date_iso, amount):
+    """A paid service from the same day for the same amount: entering it as a cost too would count it twice."""
+    return next((s for s in data["serwisy"] if s["date"] == date_iso and s.get("paidCost")
+                 and abs(s["paidCost"] - amount) < 0.005), None)
 
 
 def two_columns(parent):
@@ -1147,7 +1154,10 @@ class KosztForm(EntryForm):
         self.f_date = DateField(self.body, self.app, iso=e.get("date")).pack()
         label(self.body, "Kategoria", 12, C["text_dim"]).pack(anchor="w")
         self.v_type = tk.StringVar(value=e.get("type", "Inne"))
-        ctk.CTkOptionMenu(self.body, values=KOSZTY_TYPES, variable=self.v_type, height=40, corner_radius=10,
+        # an older entry may use a category that is no longer offered; keep it selectable for that entry
+        types = KOSZTY_TYPES + ([self.v_type.get()] if self.v_type.get() not in KOSZTY_TYPES else [])
+        self.duplicate_ok = False
+        ctk.CTkOptionMenu(self.body, values=types, variable=self.v_type, height=40, corner_radius=10,
                           font=font(14), dropdown_font=font(13), fg_color=C["surface2"],
                           button_color=C["surface2"], button_hover_color=C["surface3"], text_color=C["text"],
                           dropdown_fg_color=C["surface2"], dropdown_hover_color=C["surface3"],
@@ -1161,6 +1171,14 @@ class KosztForm(EntryForm):
         ok1, date_iso = self.check(self.f_date, self.f_date.value)
         ok2, amount = self.check(self.f_amount, lambda: parse_number(self.f_amount.get(), minimum=0))
         if not (ok1 and ok2):
+            return None
+        changed = self.initial is None or (self.initial["date"], self.initial["amount"]) != (date_iso, amount)
+        dup = same_serwis(self.app.data, date_iso, amount) if changed and not self.duplicate_ok else None
+        if dup:
+            # the second click on Zapisz saves anyway (it may really be a different expense)
+            self.duplicate_ok = True
+            self.f_amount.set_error(f"Ten wydatek jest już w Serwisach („{dup['description']}”) i liczy się "
+                                    "w kosztach. Zapisz ponownie, jeśli to coś innego.")
             return None
         return {"date": date_iso, "type": self.v_type.get(),
                 "description": self.f_desc.get() or self.v_type.get(), "amount": amount, "note": self.f_note.get()}
@@ -1418,8 +1436,28 @@ class ListPage(Page):
     def sort_key(self, e):
         return e["date"]
 
+    def entries(self):
+        """What the list shows (a page may add rows that live in another collection)."""
+        return self.app.data[self.collection]
+
+    def target(self, eid):
+        """(collection, form, id) of the stored entry behind a row."""
+        return self.collection, self.form, eid
+
     def entry_by_id(self, eid):
         return next((x for x in self.app.data[self.collection] if x["id"] == eid), None)
+
+    def open_entry(self, eid):
+        coll, form, rid = self.target(eid)
+        current = next((x for x in self.app.data[coll] if x["id"] == rid), None)
+        if current is not None:
+            form(self.app, current)
+
+    def delete_entry(self, eid):
+        coll, _, rid = self.target(eid)
+        current = next((x for x in self.app.data[coll] if x["id"] == rid), None)
+        if current is not None:
+            self.app.confirm_delete(coll, current)
 
     FIRST_BATCH, BATCH = 10, 8
     HEADER_PACK = dict(fill="x", pady=(14, 6), padx=(4, 16))
@@ -1444,7 +1482,7 @@ class ListPage(Page):
         renders the first rows at once and the rest in small batches."""
         self._generation += 1
         gen = self._generation
-        entries = sorted(self.app.data[self.collection], key=self.sort_key, reverse=True)
+        entries = sorted(self.entries(), key=self.sort_key, reverse=True)
         self.subtitle_lbl.configure(text=self.summary(entries))
         layout = self._layout(entries) if entries else []
         changed = [it for it in layout if self.items.get(it[0], (None,))[0] != it[1]]
@@ -1496,7 +1534,7 @@ class ListPage(Page):
     def finish_rendering(self):
         """Draw any rows still waiting in the batch queue (used by tests)."""
         for _ in range(500):
-            if len(self.rows) == len(self.app.data[self.collection]):
+            if len(self.rows) == len(self.entries()):
                 return
             self.update()
 
@@ -1544,14 +1582,10 @@ class ListPage(Page):
         actions.pack(side="right", padx=(6, 10))
         buttons = []
         def edit():
-            current = self.entry_by_id(eid)
-            if current is not None:
-                self.form(self.app, current)
+            self.open_entry(eid)
 
         def delete():
-            current = self.entry_by_id(eid)
-            if current is not None:
-                self.app.confirm_delete(self.collection, current)
+            self.delete_entry(eid)
 
         for name, cmd, color in (("edit", edit, C["text_dim"]), ("delete", delete, C["text_faint"])):
             b = tk.Label(actions, image=tk_icon(row, name, color), bg=C["surface"], cursor="hand2", padx=9, pady=9)
@@ -1664,6 +1698,19 @@ class KosztyPage(ListPage):
     empty_text = "Brak kosztów."
 
     form = KosztForm
+    SERWIS = "serwis:"  # row id prefix of a paid service shown here
+
+    def entries(self):
+        # paid services are costs too: listed here, but stored (and counted) once, in Serwisy
+        return self.app.data["koszty"] + [
+            {"id": self.SERWIS + s["id"], "date": s["date"], "type": "Serwis", "description": s["description"],
+             "amount": s["paidCost"], "mileage": s.get("mileage"), "note": s.get("note") or "", "serwis": True}
+            for s in self.app.data["serwisy"] if s.get("paidCost")]
+
+    def target(self, eid):
+        if eid.startswith(self.SERWIS):
+            return "serwisy", SerwisForm, eid[len(self.SERWIS):]
+        return super().target(eid)
 
     def summary(self, entries):
         if not entries:
@@ -1675,6 +1722,9 @@ class KosztyPage(ListPage):
         return pln(sum(k["amount"] for k in group))
 
     def row_text(self, k):
+        if k.get("serwis"):
+            parts = ["z Serwisów"] + ([f"{numf(k['mileage'], 0)} km"] if k.get("mileage") else [])
+            return k["description"], "  ·  ".join(parts + ([k["note"]] if k["note"] else []))
         return k["description"], k["type"] + (f"  ·  {k['note']}" if k.get("note") else "")
 
     def row_right(self, k):

@@ -305,7 +305,10 @@ const SEED_SETTINGS = {
   carName: "CUPRA TERRAMAR",
   carSubtitle: "DZIENNIK POKŁADOWY"
 };
-const KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Serwis", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"];
+// no "Serwis": services are entered in Serwisy only and appear in Koszty from there (counted once)
+const KOSZTY_TYPES = ["Zakup auta", "Ubezpieczenie", "Opony", "Myjnia", "Akcesoria", "Parking", "Inne"];
+// a paid service from the same day for the same amount: entering it as a cost too would count it twice
+const sameSerwis = (data, date, amount) => data.serwisy.find(s => s.date === date && s.paidCost && Math.abs(s.paidCost - amount) < 0.005);
 const FUEL_TYPES = ["Pb95", "Pb98"];
 
 /* ---------- HELPERS ---------- */
@@ -3022,9 +3025,16 @@ function KosztyTab({
   setData,
   notify
 }) {
-  const {
-    koszty
-  } = data;
+  // paid services are costs too: listed here, but stored (and counted) once, in Serwisy
+  const koszty = [...data.koszty, ...data.serwisy.filter(s => s.paidCost).map(s => ({
+    id: "serwis:" + s.id,
+    date: s.date,
+    type: "Serwis",
+    description: s.description,
+    amount: s.paidCost,
+    note: s.note || "",
+    serwis: s
+  }))];
   const [editing, setEditing] = useState(null);
   const byDate = (a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
   const running = sumBy(koszty.filter(k => k.type !== "Zakup auta"), "amount");
@@ -3046,20 +3056,30 @@ function KosztyTab({
               key={k.id}
               date={k.date}
               title={k.description}
-              sub={k.type + (k.note ? ` · ${k.note}` : "")}
+              sub={k.serwis ? ["z Serwisów", k.serwis.mileage ? `${num(k.serwis.mileage, 0)} km` : null, k.note || null].filter(Boolean).join(" · ") : k.type + (k.note ? ` · ${k.note}` : "")}
               amount={pln(k.amount)}
               badge={{
                 text: k.type,
                 color: k.type === "Zakup auta" ? C.copper : C.textDim
               }}
-              onOpen={() => setEditing({
+              onOpen={() => setEditing(k.serwis ? {
+                serwis: k.serwis
+              } : {
                 entry: k
               })}
             />
           )}
         />
       )}
-      {editing && (
+      {editing && (editing.serwis ? (
+        <SerwisSheet
+          data={data}
+          setData={setData}
+          notify={notify}
+          entry={editing.serwis}
+          onClose={() => setEditing(null)}
+        />
+      ) : (
         <KosztSheet
           data={data}
           setData={setData}
@@ -3067,7 +3087,7 @@ function KosztyTab({
           entry={editing.entry}
           onClose={() => setEditing(null)}
         />
-      )}
+      ))}
     </div>
   );
 }
@@ -3092,6 +3112,7 @@ function KosztSheet({
     note: ""
   });
   const [errors, setErrors] = useState({});
+  const [duplicateOk, setDuplicateOk] = useState(false);
   const set = key => value => {
     setF(prev => ({
       ...prev,
@@ -3115,6 +3136,15 @@ function KosztSheet({
     });
     if (!r.ok) return setErrors(r.errors);
     const v = r.values;
+    const changed = !entry || entry.date !== v.date || entry.amount !== v.amount;
+    const dup = changed && !duplicateOk ? sameSerwis(data, v.date, v.amount) : null;
+    if (dup) {
+      // the second tap on Zapisz saves anyway (it may really be a different expense)
+      setDuplicateOk(true);
+      return setErrors({
+        amount: `Ten wydatek jest już w Serwisach („${dup.description}”) i liczy się w kosztach. Zapisz ponownie, jeśli to coś innego.`
+      });
+    }
     const description = f.description.trim() || f.type;
     setData(upsertEntry(data, "koszty", entry, {
       date: v.date,
